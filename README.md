@@ -11,10 +11,11 @@ Blog post and demo showing how to compare two Elasticsearch indices and find mis
 └── demo/
     ├── .env.es.example                    # Template for ES credentials
     ├── .env.demo                          # Demo parameters (committed)
-    ├── .env.sh                            # Sources both env files
-    ├── escli                              # escli-rs Docker wrapper
-    ├── setup.sh                           # Start ES + pull escli image
+    ├── .env.sh                            # Sources all env files
+    ├── escli                              # escli-rs wrapper (binary or Docker fallback)
+    ├── setup.sh                           # Start ES + install escli
     ├── init-dataset.sh                    # Generate index-a and index-b
+    ├── copy-index.sh                      # Copy one index into another
     ├── compare-indices.sh                 # Find missing documents
     ├── reindex-missing.sh                 # Re-index missing docs
     └── ESCLI_COMMANDS.md                  # escli-rs command reference
@@ -24,21 +25,23 @@ Blog post and demo showing how to compare two Elasticsearch indices and find mis
 
 The article explains how to efficiently detect documents present in one index but missing in another, using:
 
-- **PIT + `search_after`** to paginate through the source index (IDs only)
+- **`_count`** for a fast pre-check
+- **PIT + `search_after`** to paginate through the source index (IDs only, no `_source`)
 - **`_mget`** to batch-check document existence in the target index
+- **`_reindex`** with an `ids` query to copy only the missing documents, entirely server-side
 
 ## Demo
 
 ### Prerequisites
 
-- [Docker](https://docs.docker.com/get-docker/) — runs Elasticsearch and escli-rs
+- [Docker](https://docs.docker.com/get-docker/) — runs Elasticsearch via start-local
 - `curl` — used by the setup script
-- `jq` — used by the comparison script (`brew install jq` / `apt install jq`)
+- `jq` — used by the comparison and reindex scripts (`brew install jq` / `apt install jq`)
 
 ### 1. Setup
 
 Start a local Elasticsearch instance using [elastic/start-local](https://github.com/elastic/start-local)
-and pull the [escli-rs](https://github.com/Anaethelion/escli-rs) Docker image:
+and install the [escli-rs](https://github.com/Anaethelion/escli-rs) binary:
 
 ```bash
 cd demo
@@ -49,7 +52,7 @@ This will:
 
 - Start Elasticsearch + Kibana via Docker on `http://localhost:9200`
 - Create `demo/.env.es` with the connection URL and API key
-- Pull the `ghcr.io/anaethelion/escli` Docker image for your architecture
+- Download the native `escli-rs` binary for your OS/architecture (falls back to the Docker image if unavailable)
 
 If Elasticsearch is already running, skip that step:
 
@@ -81,19 +84,23 @@ Create `index-a` (full dataset) and `index-b` (dataset with randomly missing doc
 
 Default parameters (override in `demo/.env.demo` or via CLI flags):
 
-| Parameter | Default | Description |
-|---|---|---|
-| `NUM_DOCS` | `1000000` | Documents generated in `index-a` |
-| `MISS_RATE` | `5` | % of docs randomly omitted from `index-b` |
-| `BULK_BATCH_SIZE` | `10000` | Documents per bulk API call |
-| `INDEX_A` | `index-a` | Source index name |
-| `INDEX_B` | `index-b` | Target index name |
+| Parameter        | Default     | Description                                    |
+|------------------|-------------|------------------------------------------------|
+| `NUM_DOCS`       | `1000000`   | Documents generated in `index-a`               |
+| `MISS_RATE`      | `5`         | % of docs randomly omitted from `index-b`      |
+| `BULK_BATCH_SIZE`| `10000`     | Documents per bulk API call                    |
+| `INDEX_A`        | `index-a`   | Source index name                              |
+| `INDEX_B`        | `index-b`   | Target index name                              |
 
 Example with custom values:
 
 ```bash
-./init-dataset.sh --num-docs 5000 --miss-rate 5
+./init-dataset.sh --num-docs 5000 --miss-rate 10
 ```
+
+At the end of the run, `init-dataset.sh` automatically saves a clean snapshot of `index-b`
+into `index-target` using `copy-index.sh`. This lets you restore `index-b` cheaply before
+re-testing different reindex strategies, without regenerating the full dataset.
 
 ### 4. Compare the indices
 
@@ -111,32 +118,19 @@ The script will:
 4. Batch-check existence in `index-b` via `_mget`
 5. Write missing IDs to `missing-ids.txt` and print a summary
 
-Example output:
-
-```txt
-[compare] Counting documents...
-  → index-a: 1000 documents
-  → index-b: 991 documents
-[compare] index-b has 9 fewer document(s) than index-a. Starting full ID comparison...
-
-[compare] Opening Point-in-Time on index-a (keep-alive: 5m)...
-[compare] Scanning index-a in batches of 1000...
-  → Page 1: 1000 IDs fetched (1000 total checked so far)...
-
-[compare] Comparison complete.
-  Total documents in index-a:            1000
-  Total documents in index-b:            991
-  Documents checked:                     1000
-  Documents missing from index-b:        9
-  Missing rate:                          ~0%
-  → Missing IDs written to: /path/to/demo/missing-ids.txt
-```
-
 Override defaults via CLI:
 
 ```bash
 ./compare-indices.sh --batch-size 500 --output my-missing.txt
 ```
+
+| Parameter          | Default          | Description                          |
+|--------------------|------------------|--------------------------------------|
+| `--source`         | `index-a`        | Source index to scan                 |
+| `--target`         | `index-b`        | Target index to check against        |
+| `--batch-size`     | `10000`          | IDs per search page / `_mget` call   |
+| `--pit-keep-alive` | `5m`             | PIT keep-alive duration              |
+| `--output`         | `missing-ids.txt`| Output file for missing IDs          |
 
 ### 5. Re-index missing documents
 
@@ -147,22 +141,48 @@ from `index-a` into `index-b`:
 ./reindex-missing.sh
 ```
 
-The script will:
+The default strategy (`mgetbulk`) fetches each batch of missing documents from `index-a` via
+`_mget` and writes them into `index-b` via `_bulk`. Use `--strategy reindex` to instead
+delegate everything to the `_reindex` API with an `ids` query — no document data crosses
+the network, making it faster for large datasets.
 
-1. Read the missing IDs from `missing-ids.txt` in batches
-2. Fetch each document from `index-a` via `_mget` (full `_source`)
-3. Bulk-index them into `index-b`
-4. Report any IDs that were no longer present in `index-a`
+| Parameter      | Default          | Description                                    |
+|----------------|------------------|------------------------------------------------|
+| `--source`     | `index-a`        | Source index to fetch documents from           |
+| `--target`     | `index-b`        | Target index to reindex into                   |
+| `--input`      | `missing-ids.txt`| File of IDs produced by `compare-indices.sh`   |
+| `--batch-size` | `10000`          | IDs per request                                |
+| `--strategy`   | `mgetbulk`       | `mgetbulk`, `reindex`, or `reindex-all`        |
 
-Override defaults via CLI:
+Strategy details:
+
+| Strategy      | Description                                                                       |
+|---------------|-----------------------------------------------------------------------------------|
+| `mgetbulk`    | `_mget` from source + `_bulk` into target (client-side transport)                 |
+| `reindex`     | `_reindex` with `ids` query per batch (server-side, no document data on the wire) |
+| `reindex-all` | `_reindex` with no filter — full copy, ignores the input file                     |
+
+### 6. Restore the snapshot and re-test
+
+To restore `index-b` from the snapshot saved by `init-dataset.sh` and run the comparison again:
 
 ```bash
-./reindex-missing.sh --input my-missing.txt --batch-size 200
+./copy-index.sh          # restores index-target → index-b (defaults)
+./compare-indices.sh
+./reindex-missing.sh --strategy reindex
 ```
 
-| Parameter | Default | Description |
-|---|---|---|
-| `--input` | `missing-ids.txt` | File of IDs produced by `compare-indices.sh` |
-| `--batch-size` | `10000` | IDs per `_mget` / bulk call |
-| `--index-a` | `index-a` | Source index to fetch documents from |
-| `--index-b` | `index-b` | Target index to reindex into |
+`copy-index.sh` can also be used standalone to copy any index:
+
+```bash
+./copy-index.sh --source my-index --target my-index-backup
+```
+
+| Parameter  | Default        | Description                               |
+|------------|----------------|-------------------------------------------|
+| `--source` | `index-target` | Index to copy from                        |
+| `--target` | `index-b`      | Index to copy into (deleted and recreated)|
+
+## License
+
+[Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0)

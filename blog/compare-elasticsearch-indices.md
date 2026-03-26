@@ -1,6 +1,6 @@
 # How to Compare Two Elasticsearch Indices and Find Missing Documents
 
-When managing Elasticsearch indices, you may need to verify that all documents present in one index also exist in another — after a reindex operation, a migration, or a data pipeline. Elasticsearch doesn't provide a built-in "diff" command for this, but you can do it efficiently by combining three APIs: `_count`, `_search` with Point-in-Time, and `_mget`.
+When managing Elasticsearch indices, you may need to verify that all documents present in one index also exist in another — after a reindex operation, a migration, or a data pipeline. Elasticsearch doesn't provide a built-in "diff" command for this, but you can do it efficiently by combining four APIs: `_count`, `_search` with Point-in-Time, `_mget`, and `_reindex`.
 
 ## The Problem
 
@@ -16,6 +16,7 @@ The approach has four steps:
 2. **Open a Point-in-Time (PIT)** on the source index to get a consistent, stable snapshot.
 3. **Paginate through all document IDs** in the source using `search_after`, fetching only `_id` (no `_source`).
 4. **Batch-check existence** in the target index using `_mget`.
+5. **Reindex missing documents** using `_reindex` with an `ids` query — entirely server-side, no document data crosses the network.
 
 Let's walk through each step.
 
@@ -135,40 +136,34 @@ The response contains one entry per requested ID, each with a `found` flag:
 
 Any entry where `"found": false` is a document missing from `index-b`. Collect those IDs — those are what you need to fix.
 
-## Step 5 — Reindex Missing Documents
+## Step 5 — Reindex Missing Documents via `_reindex`
 
-Once you have the list of missing IDs, fetch them from `index-a` using `_mget` and write them back into `index-b` using the bulk API.
+Once you have the list of missing IDs, use the `_reindex` API with an `ids` query to copy them from `index-a` into `index-b`. The key advantage over fetching and re-posting documents yourself is that **everything happens server-side**: Elasticsearch reads documents directly from the source shard and writes them to the destination, without any document content ever crossing the network to your client.
 
-Fetch a batch from the source:
-
-```bash
-./escli mget --index index-a <<< '{
-  "ids": ["id-000002", "..."]
-}'
-```
-
-Then index them into the target using the bulk API. Each document needs an action line followed by its source:
-
-```bash
-./escli bulk --input - << 'EOF'
-{"index":{"_index":"index-b","_id":"id-000002"}}
-{"title":"Document id-000002","category":"alpha",...}
-EOF
-```
-
-Documents that are no longer present in `index-a` (deleted since the comparison ran) are simply skipped rather than treated as errors.
-
-Note that you could also use the `_reindex` API to copy missing documents by passing the list of missing IDs as a query. For example:
+Process the missing IDs in batches (10,000 at a time is a good default):
 
 ```bash
 ./escli reindex <<< '{
   "source": {
     "index": "index-a",
-    "query": { "ids": { "values": ["id-000002", "..."] } }
+    "query": { "ids": { "values": ["id-000002", "id-000007", "..."] } }
   },
   "dest": { "index": "index-b" }
 }'
 ```
+
+The response tells you exactly how many documents were created or updated:
+
+```json
+{
+  "total": 10000,
+  "created": 10000,
+  "updated": 0,
+  "failures": []
+}
+```
+
+Repeat for each batch until all missing IDs have been processed.
 
 ## Performance on a 1M Dataset
 
@@ -212,20 +207,16 @@ Duration:                            4s
 
 **37 seconds to scan 1,000,000 documents and identify 50,557 missing ones. 4 seconds to reindex them all.** The approach scales well because each network round-trip carries thousands of IDs, and `_source: false` keeps the search pages small.
 
-## Why Not Use the Reindex API?
-
-Elasticsearch's built-in [`_reindex`](https://www.elastic.co/guide/en/elasticsearch/reference/current/docs-reindex.html) API copies documents from one index to another, but it always writes all matching documents — it has no concept of "only copy documents that are missing in the destination". You would overwrite existing documents in `index-b`, potentially losing updates made after the original reindex.
-
-The PIT + `search_after` + `_mget` approach only touches documents that are actually missing, making it safe to run on a live, actively-written index.
+There is also a trick here. As we are just checking for the document `_id` field, the `_mget` requests are extremely fast. If we were fetching `_source` to compare content, the network and deserialization overhead would be much higher, and the performance would degrade significantly.
 
 ## Conclusion
 
-Elasticsearch doesn't offer a native index diff command, but combining `_count`, PIT-based pagination, and batch `_mget` lookups gives you an efficient and scalable way to identify — and fix — missing documents between two indices.
+Elasticsearch doesn't offer a native index diff command, but combining `_count`, PIT-based pagination, `_mget` existence checks, and targeted `_reindex` gives you an efficient and scalable way to identify — and fix — missing documents between two indices, without ever touching documents that are already in sync.
 
 The same pattern can be extended to:
 
 - **Detect content differences**: fetch `_source` during the scan and compare field values.
-- **Multi-index comparison**: run the same PIT scan against a list of target indices in parallel.
+- **Multi-index comparison**: run the same script against a list of target indices in parallel.
 - **Continuous sync monitoring**: schedule the comparison to run periodically and alert on drift.
 
 The complete demo, including dataset generation and reindex scripts, is available at [URL_PLACE_HOLDER].
