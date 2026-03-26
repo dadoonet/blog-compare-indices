@@ -12,13 +12,7 @@ if [ -f "$BINARY" ] && [ -x "$BINARY" ]; then
 fi
 
 # ── Fallback: Docker ──────────────────────────────────────────────────────────
-case "$(uname -m)" in
-    arm64|aarch64) IMAGE="ghcr.io/anaethelion/escli:latest-arm64" ;;
-    x86_64)        IMAGE="ghcr.io/anaethelion/escli:latest-amd64" ;;
-    *)             echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
-esac
-
 docker run --network host -i --rm \
   -e ESCLI_URL \
   -e ESCLI_API_KEY \
-  "$IMAGE" "$@"
+  ghcr.io/anaethelion/escli:latest "$@"
