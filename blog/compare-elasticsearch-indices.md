@@ -219,4 +219,4 @@ The same pattern can be extended to:
 - **Multi-index comparison**: run the same script against a list of target indices in parallel.
 - **Continuous sync monitoring**: schedule the comparison to run periodically and alert on drift.
 
-The complete demo, including dataset generation and reindex scripts, is available at [URL_PLACE_HOLDER].
+The complete demo, including dataset generation and reindex scripts, is available at [[URL_PLACE_HOLDER](https://github.com/dadoonet/blog-compare-indices/)].
