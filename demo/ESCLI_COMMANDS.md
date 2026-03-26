@@ -33,9 +33,12 @@ JSON bodies are passed via stdin using a here-string (`<<<`).
 
 ```bash
 ./escli count --index <index>
+# When using the Docker image, there's a bug and you must pass a body, even if empty.
+./escli count --index <index> <<< '{}'
 ```
 
 Example:
+
 ```bash
 COUNT=$(./escli count --index index-a | jq -r '.count')
 ```
@@ -50,6 +53,7 @@ COUNT=$(./escli count --index index-a | jq -r '.count')
 ```
 
 The file must follow the Elasticsearch NDJSON bulk format:
+
 ```json
 {"index":{"_index":"my-index","_id":"id-000001"}}
 {"title":"Document id-000001","value":42}
@@ -64,8 +68,11 @@ The file must follow the Elasticsearch NDJSON bulk format:
 ```
 
 Example:
+
 ```bash
 PIT_ID=$(./escli open_point_in_time index-a 5m | jq -r '.id')
+# When using the Docker image, there's a bug and you must pass a body, even if empty.
+PIT_ID=$(./escli open_point_in_time index-a 5m <<< '{}' | jq -r '.id')
 ```
 
 ---
@@ -77,6 +84,7 @@ PIT_ID=$(./escli open_point_in_time index-a 5m | jq -r '.id')
 ```
 
 Example:
+
 ```bash
 ./escli search <<< '{
   "size": 1000,

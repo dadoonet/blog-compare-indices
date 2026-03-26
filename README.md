@@ -4,7 +4,7 @@ Blog post and demo showing how to compare two Elasticsearch indices and find mis
 
 ## Structure
 
-```
+```txt
 .
 ├── blog/
 │   └── compare-elasticsearch-indices.md   # The blog article
@@ -16,7 +16,7 @@ Blog post and demo showing how to compare two Elasticsearch indices and find mis
     ├── setup.sh                           # Start ES + pull escli image
     ├── init-dataset.sh                    # Generate index-a and index-b
     ├── compare-indices.sh                 # Find missing documents
-    ├── reindex-missing.sh                 # Re-index missing docs (TODO)
+    ├── reindex-missing.sh                 # Re-index missing docs
     └── ESCLI_COMMANDS.md                  # escli-rs command reference
 ```
 
@@ -83,9 +83,9 @@ Default parameters (override in `demo/.env.demo` or via CLI flags):
 
 | Parameter | Default | Description |
 |---|---|---|
-| `NUM_DOCS` | `1000` | Documents generated in `index-a` |
-| `MISS_RATE` | `1` | % of docs randomly omitted from `index-b` |
-| `BULK_BATCH_SIZE` | `500` | Documents per bulk API call |
+| `NUM_DOCS` | `1000000` | Documents generated in `index-a` |
+| `MISS_RATE` | `5` | % of docs randomly omitted from `index-b` |
+| `BULK_BATCH_SIZE` | `10000` | Documents per bulk API call |
 | `INDEX_A` | `index-a` | Source index name |
 | `INDEX_B` | `index-b` | Target index name |
 
@@ -140,5 +140,29 @@ Override defaults via CLI:
 
 ### 5. Re-index missing documents
 
-> **Coming soon** — `reindex-missing.sh` will read `missing-ids.txt`, fetch the documents
-> from `index-a`, and bulk-index them into `index-b`.
+Once `compare-indices.sh` has produced `missing-ids.txt`, re-index the missing documents
+from `index-a` into `index-b`:
+
+```bash
+./reindex-missing.sh
+```
+
+The script will:
+
+1. Read the missing IDs from `missing-ids.txt` in batches
+2. Fetch each document from `index-a` via `_mget` (full `_source`)
+3. Bulk-index them into `index-b`
+4. Report any IDs that were no longer present in `index-a`
+
+Override defaults via CLI:
+
+```bash
+./reindex-missing.sh --input my-missing.txt --batch-size 200
+```
+
+| Parameter | Default | Description |
+|---|---|---|
+| `--input` | `missing-ids.txt` | File of IDs produced by `compare-indices.sh` |
+| `--batch-size` | `10000` | IDs per `_mget` / bulk call |
+| `--index-a` | `index-a` | Source index to fetch documents from |
+| `--index-b` | `index-b` | Target index to reindex into |

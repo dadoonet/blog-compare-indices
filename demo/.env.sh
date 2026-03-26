@@ -14,3 +14,6 @@ fi
 
 # Demo parameters — committed, no secrets
 source "${SCRIPT_DIR}/.env.demo"
+
+# escli-rs version — committed
+source "${SCRIPT_DIR}/.env.escli"

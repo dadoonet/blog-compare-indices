@@ -21,6 +21,9 @@ Thumbs.db
 # Demo artifacts
 # created by start-local, contains credentials
 demo/elastic-start-local/
+# downloaded escli binary and installed version tracker
+demo/escli-bin
+demo/.escli-version
 # output of compare-indices.sh
 demo/missing-ids.txt
 demo/*.txt

@@ -2,28 +2,146 @@
 # reindex-missing.sh — Re-index documents from index-a into index-b.
 #
 # Reads the list of missing document IDs produced by compare-indices.sh,
-# fetches each document from index-a in batches using _mget, and reindexes
+# fetches each document from index-a in batches using _mget, then reindexes
 # them into index-b using the bulk API.
 #
+# Requirements: escli (./escli wrapper), jq
+#
 # Usage: ./reindex-missing.sh [options]
-#   --url <url>         Elasticsearch URL             (default: from .env)
-#   --api-key <key>     API key                       (default: from .env)
 #   --index-a <name>    Source index                  (default: index-a)
 #   --index-b <name>    Target index                  (default: index-b)
 #   --input <file>      File with missing IDs         (default: missing-ids.txt)
-#   --batch-size <n>    IDs per _mget / bulk call     (default: 500)
-#
-# TODO: implement this script once compare-indices.sh is validated.
-# Outline of the implementation:
-#
-#   1. Read IDs line by line from the input file
-#   2. Group them into batches of --batch-size
-#   3. For each batch:
-#        a. Fetch documents from index-a using _mget (with _source: true this time)
-#        b. Build a bulk NDJSON payload from the returned _source objects
-#        c. Index them into index-b using the bulk API
-#   4. Print a summary (total reindexed, errors)
+#   --batch-size <n>    IDs per _mget / bulk call     (default: 10000)
 
-echo "reindex-missing.sh is not yet implemented."
-echo "Run compare-indices.sh first to generate the list of missing IDs."
-exit 1
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ESCLI="${SCRIPT_DIR}/escli"
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
+log()  { echo -e "${GREEN}[reindex]${NC} $*"; }
+info() { echo -e "${BLUE}  →${NC} $*"; }
+warn() { echo -e "${YELLOW}[reindex]${NC} $*"; }
+die()  { echo -e "${RED}[reindex] ERROR:${NC} $*" >&2; exit 1; }
+
+format_duration() {
+    local s=$1
+    local h=$(( s / 3600 )) m=$(( (s % 3600) / 60 )) sec=$(( s % 60 ))
+    (( h > 0 ))  && printf "%dh %02dm %02ds" $h $m $sec && return
+    (( m > 0 ))  && printf "%dm %02ds" $m $sec          && return
+    printf "%ds" $sec
+}
+
+SECONDS=0   # bash built-in: counts elapsed seconds automatically
+
+# ── Load defaults from .env.sh, then allow CLI overrides ──────────────────────
+set -a && set +u && source "${SCRIPT_DIR}/.env.sh" && set -u && set +a
+
+: "${INDEX_A:=index-a}"
+: "${INDEX_B:=index-b}"
+: "${OUTPUT_FILE:=missing-ids.txt}"
+: "${BATCH_SIZE:=10000}"
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --index-a)    INDEX_A="$2";     shift 2 ;;
+        --index-b)    INDEX_B="$2";     shift 2 ;;
+        --input)      OUTPUT_FILE="$2"; shift 2 ;;
+        --batch-size) BATCH_SIZE="$2";  shift 2 ;;
+        -h|--help)
+            grep '^# ' "$0" | head -15 | sed 's/^# \?//'
+            exit 0 ;;
+        *) die "Unknown option: $1" ;;
+    esac
+done
+
+command -v jq >/dev/null || die "jq is required (brew install jq / apt install jq)"
+[ -f "$ESCLI" ]          || die "escli not found at ${ESCLI}. Run ./setup.sh first."
+
+INPUT_FILE="${SCRIPT_DIR}/${OUTPUT_FILE}"
+[ -f "$INPUT_FILE" ]     || die "Input file not found: ${INPUT_FILE}. Run ./compare-indices.sh first."
+
+TOTAL_IDS=$(wc -l < "$INPUT_FILE" | tr -d ' ')
+[ "$TOTAL_IDS" -eq 0 ]   && { log "Input file is empty — nothing to reindex."; exit 0; }
+
+log "Re-indexing ${TOTAL_IDS} missing document(s) from ${INDEX_A} into ${INDEX_B}..."
+log "Batch size: ${BATCH_SIZE}"
+echo ""
+
+# ── Process a batch of IDs ────────────────────────────────────────────────────
+# Fetches documents from index-a via _mget, then bulk-indexes them into index-b.
+# Documents not found in index-a (e.g. deleted since the comparison ran) are
+# counted and skipped rather than treated as errors.
+process_batch() {
+    local -a ids=("$@")
+
+    # Build the _mget request body
+    local ids_json mget_body mget_response
+    ids_json=$(printf '%s\n' "${ids[@]}" | jq -R . | jq -s .)
+    mget_body=$(jq -n --argjson ids "$ids_json" '{"ids": $ids}')
+    mget_response=$("$ESCLI" mget --index "$INDEX_A" <<< "$mget_body")
+
+    # Build bulk NDJSON: one action line + one source line per found document.
+    # Documents where found == false are silently skipped (counted separately).
+    local bulk_ndjson
+    bulk_ndjson=$(echo "$mget_response" | jq -r --arg index "$INDEX_B" '
+        .docs[] |
+        select(.found == true) |
+        ({"index": {"_index": $index, "_id": ._id}} | tojson),
+        (._source | tojson)
+    ')
+
+    # Count how many were not found (deleted from index-a since comparison)
+    local not_found
+    not_found=$(echo "$mget_response" | jq '[.docs[] | select(.found == false)] | length')
+    NOT_FOUND_TOTAL=$(( NOT_FOUND_TOTAL + not_found ))
+
+    if [ -n "$bulk_ndjson" ]; then
+        local bulk_response
+        bulk_response=$("$ESCLI" bulk --input - <<< "$bulk_ndjson")
+
+        if echo "$bulk_response" | grep -q '"errors":true'; then
+            die "Bulk errors detected: $(echo "$bulk_response" | grep -o '"reason":"[^"]*"' | head -3)"
+        fi
+
+        local indexed
+        indexed=$(echo "$bulk_response" | jq '[.items[].index | select(.status == 200 or .status == 201)] | length')
+        REINDEXED_TOTAL=$(( REINDEXED_TOTAL + indexed ))
+    fi
+}
+
+# ── Paginate through the input file in batches ────────────────────────────────
+REINDEXED_TOTAL=0
+NOT_FOUND_TOTAL=0
+BATCH=()
+BATCH_NUM=0
+
+while IFS= read -r doc_id; do
+    [ -z "$doc_id" ] && continue
+    BATCH+=("$doc_id")
+
+    if (( ${#BATCH[@]} >= BATCH_SIZE )); then
+        BATCH_NUM=$(( BATCH_NUM + 1 ))
+        info "Processing batch ${BATCH_NUM} (${#BATCH[@]} IDs)..."
+        process_batch "${BATCH[@]}"
+        BATCH=()
+    fi
+done < "$INPUT_FILE"
+
+# Flush the last partial batch
+if (( ${#BATCH[@]} > 0 )); then
+    BATCH_NUM=$(( BATCH_NUM + 1 ))
+    info "Processing batch ${BATCH_NUM} (${#BATCH[@]} IDs)..."
+    process_batch "${BATCH[@]}"
+fi
+
+# ── Summary ───────────────────────────────────────────────────────────────────
+echo ""
+log "Re-indexing complete."
+printf "  %-38s %d\n" "IDs read from input file:"           "$TOTAL_IDS"
+printf "  %-38s %d\n" "Documents re-indexed into ${INDEX_B}:" "$REINDEXED_TOTAL"
+
+if (( NOT_FOUND_TOTAL > 0 )); then
+    printf "  %-38s %d\n" "Not found in ${INDEX_A} (skipped):" "$NOT_FOUND_TOTAL"
+    warn "Some documents were no longer present in ${INDEX_A}."
+fi
+printf "  %-38s %s\n" "Duration:" "$(format_duration $SECONDS)"

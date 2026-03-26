@@ -95,13 +95,18 @@ if ! $SKIP_START_LOCAL; then
     log ".env.es updated with connection details."
 fi
 
-# ── 5. Set up escli-rs via Docker ─────────────────────────────────────────────
-# escli-rs is run as a Docker container. A thin wrapper script is generated at
-# demo/escli so the other scripts can call it transparently as ./escli <cmd>.
+# ── 5. Set up escli-rs ────────────────────────────────────────────────────────
+# Preferred: download the native binary (much faster than Docker).
+# Fallback:  pull the Docker image if the binary download fails.
 # https://github.com/Anaethelion/escli-rs
-ESCLI_BIN="${SCRIPT_DIR}/escli"
 
-# Pick the image tag that matches the host architecture
+# Load ESCLI_VERSION from .env.escli
+set -a && set +u && source "${SCRIPT_DIR}/.env.escli" && set -u && set +a
+
+ESCLI_BINARY="${SCRIPT_DIR}/escli-bin"
+ESCLI_VERSION_FILE="${SCRIPT_DIR}/.escli-version"
+
+# Pick Docker image tag for the fallback
 case "$(uname -m)" in
     arm64|aarch64) ESCLI_IMAGE="ghcr.io/anaethelion/escli:latest-arm64" ;;
     x86_64)        ESCLI_IMAGE="ghcr.io/anaethelion/escli:latest-amd64" ;;
@@ -109,20 +114,43 @@ case "$(uname -m)" in
 esac
 
 if ! $SKIP_ESCLI; then
-    log "Pulling escli Docker image: ${ESCLI_IMAGE}..."
-    docker pull "$ESCLI_IMAGE"
-    log "Image ready. The ./escli wrapper will use it automatically."
+    # Check if the correct version is already installed
+    INSTALLED_VERSION=""
+    [ -f "$ESCLI_VERSION_FILE" ] && INSTALLED_VERSION=$(cat "$ESCLI_VERSION_FILE")
+
+    if [ -f "$ESCLI_BINARY" ] && [ "$INSTALLED_VERSION" = "$ESCLI_VERSION" ]; then
+        log "escli binary ${ESCLI_VERSION} already installed — skipping download."
+    else
+        case "$(uname -s)" in
+            Darwin) BINARY_NAME="escli-macos" ;;
+            Linux)  BINARY_NAME="escli-linux" ;;
+            *)      die "Unsupported OS: $(uname -s)" ;;
+        esac
+        DOWNLOAD_URL="https://github.com/Anaethelion/escli-rs/releases/download/${ESCLI_VERSION}/${BINARY_NAME}"
+
+        log "Downloading escli-rs ${ESCLI_VERSION}..."
+        if curl -fsSL "$DOWNLOAD_URL" -o "$ESCLI_BINARY"; then
+            chmod +x "$ESCLI_BINARY"
+            # Remove macOS quarantine flag for unsigned binaries
+            [[ "$OSTYPE" == darwin* ]] && xattr -d com.apple.quarantine "$ESCLI_BINARY" 2>/dev/null || true
+            echo "$ESCLI_VERSION" > "$ESCLI_VERSION_FILE"
+            log "escli binary installed at ${ESCLI_BINARY}."
+        else
+            warn "Binary download failed. Falling back to Docker image..."
+            docker pull "$ESCLI_IMAGE" && log "Docker image ${ESCLI_IMAGE} ready as fallback."
+        fi
+    fi
 fi
 
 # ── 6. Smoke test ─────────────────────────────────────────────────────────────
-if [ -f "$ESCLI_BIN" ] && [ -f "${SCRIPT_DIR}/.env.es" ]; then
+if [ -f "${SCRIPT_DIR}/escli" ] && [ -f "${SCRIPT_DIR}/.env.es" ]; then
     log "Testing connection to Elasticsearch..."
     set -a; set +u; source "${SCRIPT_DIR}/.env.sh"; set -u; set +a
-    if "${ESCLI_BIN}" info &>/dev/null; then
+    if "${SCRIPT_DIR}/escli" info &>/dev/null; then
         log "Connection OK."
     else
         warn "Cannot reach Elasticsearch yet — it may still be starting up."
-        warn "Wait a few seconds then run: ${ESCLI_BIN} info"
+        warn "Wait a few seconds then run: ./escli info"
     fi
 fi
 

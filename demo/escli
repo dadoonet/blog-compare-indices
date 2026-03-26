@@ -1,10 +1,17 @@
 #!/usr/bin/env bash
-# Wrapper for escli-rs running as a Docker container.
-# Sources demo/.env so that ESCLI_URL and ESCLI_API_KEY are always available,
-# regardless of whether they are exported in the calling shell.
+# escli wrapper — runs escli-rs using the local binary when available,
+# and falls back to Docker if not.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 set -a && set +u && source "${SCRIPT_DIR}/.env.sh" && set -u && set +a
 
+# ── Prefer the local binary (much faster than Docker) ─────────────────────────
+BINARY="${SCRIPT_DIR}/escli-bin"
+
+if [ -f "$BINARY" ] && [ -x "$BINARY" ]; then
+    exec "$BINARY" "$@"
+fi
+
+# ── Fallback: Docker ──────────────────────────────────────────────────────────
 case "$(uname -m)" in
     arm64|aarch64) IMAGE="ghcr.io/anaethelion/escli:latest-arm64" ;;
     x86_64)        IMAGE="ghcr.io/anaethelion/escli:latest-amd64" ;;

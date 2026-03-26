@@ -17,7 +17,7 @@
 # Usage: ./compare-indices.sh [options]
 #   --index-a <name>       Source index                   (default: index-a)
 #   --index-b <name>       Target index                   (default: index-b)
-#   --batch-size <n>       IDs per search page / _mget call (default: 1000)
+#   --batch-size <n>       IDs per search page / _mget call (default: 10000 - can't be more than ES's max_result_window)
 #   --pit-keep-alive <dur> PIT keep-alive duration        (default: 5m)
 #   --output <file>        Output file for missing IDs    (default: missing-ids.txt)
 
@@ -31,12 +31,22 @@ info() { echo -e "${BLUE}  →${NC} $*"; }
 warn() { echo -e "${YELLOW}[compare]${NC} $*"; }
 die()  { echo -e "${RED}[compare] ERROR:${NC} $*" >&2; exit 1; }
 
+format_duration() {
+    local s=$1
+    local h=$(( s / 3600 )) m=$(( (s % 3600) / 60 )) sec=$(( s % 60 ))
+    (( h > 0 ))  && printf "%dh %02dm %02ds" $h $m $sec && return
+    (( m > 0 ))  && printf "%dm %02ds" $m $sec          && return
+    printf "%ds" $sec
+}
+
+SECONDS=0   # bash built-in: counts elapsed seconds automatically
+
 # ── Load defaults from .env.sh, then allow CLI overrides ──────────────────────
 set -a && set +u && source "${SCRIPT_DIR}/.env.sh" && set -u && set +a
 
 : "${INDEX_A:=index-a}"
 : "${INDEX_B:=index-b}"
-: "${BATCH_SIZE:=1000}"
+: "${BATCH_SIZE:=10000}"
 : "${PIT_KEEP_ALIVE:=5m}"
 : "${OUTPUT_FILE:=missing-ids.txt}"
 
@@ -125,7 +135,6 @@ while true; do
         --arg    keep_alive    "$PIT_KEEP_ALIVE" \
         '{
             "size": $size,
-            "query": {"match_all": {}},
             "_source": false,
             "pit": {"id": $pit_id, "keep_alive": $keep_alive},
             "sort": [{"_shard_doc": "asc"}]
@@ -154,7 +163,7 @@ while true; do
     # whether the document exists in the target index, without fetching its content.
     IDS_JSON=$(echo "$HITS" | jq -c '[.[]._id]')
     MGET_BODY=$(jq -n --argjson ids "$IDS_JSON" '{"ids": $ids}')
-    MGET_RESPONSE=$("$ESCLI" mget --index "$INDEX_B" <<< "$MGET_BODY")
+    MGET_RESPONSE=$("$ESCLI" mget --index "$INDEX_B" --_source false <<< "$MGET_BODY")
 
     # Extract IDs where found == false
     MISSING_IDS=$(echo "$MGET_RESPONSE" | jq -r '.docs[] | select(.found == false) | ._id')
@@ -176,6 +185,10 @@ printf "  %-38s %d\n" "Documents missing from ${INDEX_B}:"   "$MISSING_COUNT"
 if (( MISSING_COUNT > 0 && TOTAL_CHECKED > 0 )); then
     PCT=$(( MISSING_COUNT * 100 / TOTAL_CHECKED ))
     printf "  %-38s ~%d%%\n" "Missing rate:"                  "$PCT"
+fi
+printf "  %-38s %s\n" "Duration:" "$(format_duration $SECONDS)"
+
+if (( MISSING_COUNT > 0 )); then
     echo ""
     info "Missing IDs written to: ${OUTPUT_PATH}"
     warn "Run ./reindex-missing.sh to reindex them from ${INDEX_A} into ${INDEX_B}."
