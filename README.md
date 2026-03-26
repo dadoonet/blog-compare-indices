@@ -2,6 +2,8 @@
 
 Blog post and demo showing how to compare two Elasticsearch indices and find missing documents.
 
+![Compare Elasticsearch Indices](compare-elasticsearch-indices.png)
+
 ## Structure
 
 ```txt
