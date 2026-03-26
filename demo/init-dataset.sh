@@ -11,9 +11,9 @@
 #
 # Usage: ./init-dataset.sh [options]
 #   --num-docs <n>         Documents to generate         (default: 1000000)
-#   --miss-rate <pct>      % of docs omitted from index-b (default: 5)
-#   --index-a <name>       Source index name             (default: index-a)
-#   --index-b <name>       Target index name             (default: index-b)
+#   --miss-rate <pct>      % of docs omitted from target (default: 5)
+#   --source <name>        Source index name             (default: index-a)
+#   --target <name>        Target index name             (default: index-b)
 #   --bulk-batch-size <n>  Docs per bulk request         (default: 10000)
 
 set -euo pipefail
@@ -50,8 +50,8 @@ while [[ $# -gt 0 ]]; do
     case $1 in
         --num-docs)        NUM_DOCS="$2";          shift 2 ;;
         --miss-rate)       MISS_RATE="$2";         shift 2 ;;
-        --index-a)         INDEX_A="$2";           shift 2 ;;
-        --index-b)         INDEX_B="$2";           shift 2 ;;
+        --source)          INDEX_A="$2";           shift 2 ;;
+        --target)          INDEX_B="$2";           shift 2 ;;
         --bulk-batch-size) BULK_BATCH_SIZE="$2";   shift 2 ;;
         -h|--help)
             grep '^# ' "$0" | head -15 | sed 's/^# \?//'
@@ -254,5 +254,13 @@ if (( BATCH_COUNT_B > 0 )); then
 fi
 printf "  %-36s %s\n" "Duration:" "$(format_duration $SECONDS)"
 
+# ── Snapshot: copy target index so it can be restored cheaply ─────────────────
+# Saves a clean copy of INDEX_B as "index-target". Use ./copy-index.sh to
+# restore it before re-running reindex-missing.sh without regenerating the dataset.
+echo ""
+log "Saving snapshot of ${INDEX_B} → index-target..."
+"${SCRIPT_DIR}/copy-index.sh" --source "$INDEX_B" --target "index-target"
+
 echo ""
 log "Run ./compare-indices.sh to find the missing document IDs."
+log "Run ./copy-index.sh to restore ${INDEX_B} from the snapshot before re-testing."

@@ -15,8 +15,8 @@
 # Requirements: escli (./escli wrapper), jq
 #
 # Usage: ./compare-indices.sh [options]
-#   --index-a <name>       Source index                   (default: index-a)
-#   --index-b <name>       Target index                   (default: index-b)
+#   --source <name>        Source index                   (default: index-a)
+#   --target <name>        Target index                   (default: index-b)
 #   --batch-size <n>       IDs per search page / _mget call (default: 10000 - can't be more than ES's max_result_window)
 #   --pit-keep-alive <dur> PIT keep-alive duration        (default: 5m)
 #   --output <file>        Output file for missing IDs    (default: missing-ids.txt)
@@ -52,8 +52,8 @@ set -a && set +u && source "${SCRIPT_DIR}/.env.sh" && set -u && set +a
 
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --index-a)         INDEX_A="$2";          shift 2 ;;
-        --index-b)         INDEX_B="$2";          shift 2 ;;
+        --source)          INDEX_A="$2";          shift 2 ;;
+        --target)          INDEX_B="$2";          shift 2 ;;
         --batch-size)      BATCH_SIZE="$2";       shift 2 ;;
         --pit-keep-alive)  PIT_KEEP_ALIVE="$2";   shift 2 ;;
         --output)          OUTPUT_FILE="$2";      shift 2 ;;

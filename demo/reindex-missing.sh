@@ -8,10 +8,14 @@
 # Requirements: escli (./escli wrapper), jq
 #
 # Usage: ./reindex-missing.sh [options]
-#   --index-a <name>    Source index                  (default: index-a)
-#   --index-b <name>    Target index                  (default: index-b)
+#   --source <name>     Source index                  (default: index-a)
+#   --target <name>     Target index                  (default: index-b)
 #   --input <file>      File with missing IDs         (default: missing-ids.txt)
 #   --batch-size <n>    IDs per _mget / bulk call     (default: 10000)
+#   --strategy <name>   Reindex strategy              (default: mgetbulk)
+#                         mgetbulk    _mget from index-a + bulk into index-b (default)
+#                         reindex     _reindex API with ids query, batched from input file
+#                         reindex-all _reindex API with no filter (full copy)
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -40,23 +44,62 @@ set -a && set +u && source "${SCRIPT_DIR}/.env.sh" && set -u && set +a
 : "${INDEX_B:=index-b}"
 : "${OUTPUT_FILE:=missing-ids.txt}"
 : "${BATCH_SIZE:=10000}"
+: "${STRATEGY:=mgetbulk}"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --index-a)    INDEX_A="$2";     shift 2 ;;
-        --index-b)    INDEX_B="$2";     shift 2 ;;
+        --source)     INDEX_A="$2";     shift 2 ;;
+        --target)     INDEX_B="$2";     shift 2 ;;
         --input)      OUTPUT_FILE="$2"; shift 2 ;;
         --batch-size) BATCH_SIZE="$2";  shift 2 ;;
+        --strategy)   STRATEGY="$2";    shift 2 ;;
         -h|--help)
-            grep '^# ' "$0" | head -15 | sed 's/^# \?//'
+            grep '^# ' "$0" | head -20 | sed 's/^# \?//'
             exit 0 ;;
         *) die "Unknown option: $1" ;;
     esac
 done
 
+case "$STRATEGY" in
+    mgetbulk|reindex|reindex-all) ;;
+    *) die "Unknown strategy: ${STRATEGY}. Valid values: mgetbulk, reindex, reindex-all" ;;
+esac
+
 command -v jq >/dev/null || die "jq is required (brew install jq / apt install jq)"
 [ -f "$ESCLI" ]          || die "escli not found at ${ESCLI}. Run ./setup.sh first."
 
+# ── strategy: reindex-all ─────────────────────────────────────────────────────
+# Full copy of index-a into index-b via the _reindex API. No input file needed.
+if [[ "$STRATEGY" == "reindex-all" ]]; then
+    log "Strategy: reindex-all — copying all documents from ${INDEX_A} into ${INDEX_B}..."
+    echo ""
+
+    REINDEX_BODY=$(jq -n \
+        --arg src "$INDEX_A" \
+        --arg dst "$INDEX_B" \
+        '{"source":{"index":$src},"dest":{"index":$dst}}')
+
+    REINDEX_RESPONSE=$("$ESCLI" reindex <<< "$REINDEX_BODY")
+
+    TOTAL=$(echo "$REINDEX_RESPONSE"  | jq '.total')
+    CREATED=$(echo "$REINDEX_RESPONSE" | jq '.created')
+    UPDATED=$(echo "$REINDEX_RESPONSE" | jq '.updated')
+    FAILURES=$(echo "$REINDEX_RESPONSE" | jq '.failures | length')
+
+    echo ""
+    log "Re-indexing complete."
+    printf "  %-38s %d\n" "Documents processed:"                "$TOTAL"
+    printf "  %-38s %d\n" "Created in ${INDEX_B}:"             "$CREATED"
+    printf "  %-38s %d\n" "Updated in ${INDEX_B}:"             "$UPDATED"
+    if (( FAILURES > 0 )); then
+        printf "  %-38s %d\n" "Failures:" "$FAILURES"
+        warn "Some documents failed to reindex."
+    fi
+    printf "  %-38s %s\n" "Duration:" "$(format_duration $SECONDS)"
+    exit 0
+fi
+
+# ── strategies that require an input file ─────────────────────────────────────
 INPUT_FILE="${SCRIPT_DIR}/${OUTPUT_FILE}"
 [ -f "$INPUT_FILE" ]     || die "Input file not found: ${INPUT_FILE}. Run ./compare-indices.sh first."
 
@@ -64,14 +107,14 @@ TOTAL_IDS=$(wc -l < "$INPUT_FILE" | tr -d ' ')
 [ "$TOTAL_IDS" -eq 0 ]   && { log "Input file is empty — nothing to reindex."; exit 0; }
 
 log "Re-indexing ${TOTAL_IDS} missing document(s) from ${INDEX_A} into ${INDEX_B}..."
-log "Batch size: ${BATCH_SIZE}"
+log "Strategy: ${STRATEGY} | Batch size: ${BATCH_SIZE}"
 echo ""
 
-# ── Process a batch of IDs ────────────────────────────────────────────────────
+# ── Process a batch of IDs — mgetbulk strategy ────────────────────────────────
 # Fetches documents from index-a via _mget, then bulk-indexes them into index-b.
 # Documents not found in index-a (e.g. deleted since the comparison ran) are
 # counted and skipped rather than treated as errors.
-process_batch() {
+process_batch_mgetbulk() {
     local -a ids=("$@")
 
     # Build the _mget request body
@@ -109,6 +152,31 @@ process_batch() {
     fi
 }
 
+# ── Process a batch of IDs — reindex strategy ─────────────────────────────────
+# Uses the _reindex API with an ids query to copy only the specified documents.
+process_batch_reindex() {
+    local -a ids=("$@")
+
+    local ids_json reindex_body reindex_response
+    ids_json=$(printf '%s\n' "${ids[@]}" | jq -R . | jq -s .)
+    reindex_body=$(jq -n \
+        --arg     src  "$INDEX_A" \
+        --arg     dst  "$INDEX_B" \
+        --argjson ids  "$ids_json" \
+        '{"source":{"index":$src,"query":{"ids":{"values":$ids}}},"dest":{"index":$dst}}')
+
+    reindex_response=$("$ESCLI" reindex <<< "$reindex_body")
+
+    if echo "$reindex_response" | jq -e '.failures | length > 0' > /dev/null; then
+        die "Reindex failures: $(echo "$reindex_response" | jq '.failures[:3]')"
+    fi
+
+    local created updated
+    created=$(echo "$reindex_response" | jq '.created')
+    updated=$(echo "$reindex_response" | jq '.updated')
+    REINDEXED_TOTAL=$(( REINDEXED_TOTAL + created + updated ))
+}
+
 # ── Paginate through the input file in batches ────────────────────────────────
 REINDEXED_TOTAL=0
 NOT_FOUND_TOTAL=0
@@ -122,7 +190,10 @@ while IFS= read -r doc_id; do
     if (( ${#BATCH[@]} >= BATCH_SIZE )); then
         BATCH_NUM=$(( BATCH_NUM + 1 ))
         info "Processing batch ${BATCH_NUM} (${#BATCH[@]} IDs)..."
-        process_batch "${BATCH[@]}"
+        case "$STRATEGY" in
+            mgetbulk) process_batch_mgetbulk "${BATCH[@]}" ;;
+            reindex)  process_batch_reindex  "${BATCH[@]}" ;;
+        esac
         BATCH=()
     fi
 done < "$INPUT_FILE"
@@ -131,7 +202,10 @@ done < "$INPUT_FILE"
 if (( ${#BATCH[@]} > 0 )); then
     BATCH_NUM=$(( BATCH_NUM + 1 ))
     info "Processing batch ${BATCH_NUM} (${#BATCH[@]} IDs)..."
-    process_batch "${BATCH[@]}"
+    case "$STRATEGY" in
+        mgetbulk) process_batch_mgetbulk "${BATCH[@]}" ;;
+        reindex)  process_batch_reindex  "${BATCH[@]}" ;;
+    esac
 fi
 
 # ── Summary ───────────────────────────────────────────────────────────────────
