@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Wrapper for escli-rs running as a Docker container.
+# Sources demo/.env so that ESCLI_URL and ESCLI_API_KEY are always available,
+# regardless of whether they are exported in the calling shell.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+set -a && set +u && source "${SCRIPT_DIR}/.env.sh" && set -u && set +a
+
+case "$(uname -m)" in
+    arm64|aarch64) IMAGE="ghcr.io/anaethelion/escli:latest-arm64" ;;
+    x86_64)        IMAGE="ghcr.io/anaethelion/escli:latest-amd64" ;;
+    *)             echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+esac
+
+docker run --network host -i --rm \
+  -e ESCLI_URL \
+  -e ESCLI_API_KEY \
+  "$IMAGE" "$@"

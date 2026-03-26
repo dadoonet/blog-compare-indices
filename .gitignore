@@ -19,6 +19,8 @@ __pycache__/
 Thumbs.db
 
 # Demo artifacts
-demo/elastic-start-local/   # created by start-local, contains credentials
-demo/missing-ids.txt        # output of compare-indices.sh
+# created by start-local, contains credentials
+demo/elastic-start-local/
+# output of compare-indices.sh
+demo/missing-ids.txt
 demo/*.txt

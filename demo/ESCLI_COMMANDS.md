@@ -1,0 +1,107 @@
+# escli-rs Command Reference
+
+All commands read `ESCLI_URL` and `ESCLI_API_KEY` from the environment (sourced via `.env.sh`).
+JSON bodies are passed via stdin using a here-string (`<<<`).
+
+---
+
+## Delete an index ✅
+
+```bash
+./escli delete <index>
+```
+
+---
+
+## Create an index ✅
+
+```bash
+./escli create <index>
+```
+
+---
+
+## Connection test ✅
+
+```bash
+./escli info
+```
+
+---
+
+## Document count ✅
+
+```bash
+./escli count --index <index>
+```
+
+Example:
+```bash
+COUNT=$(./escli count --index index-a | jq -r '.count')
+```
+
+---
+
+## Bulk indexing ✅
+
+```bash
+# Pass via stdin — required when escli runs in Docker (no access to host paths)
+./escli bulk --input - < file.ndjson
+```
+
+The file must follow the Elasticsearch NDJSON bulk format:
+```json
+{"index":{"_index":"my-index","_id":"id-000001"}}
+{"title":"Document id-000001","value":42}
+```
+
+---
+
+## Open Point-in-Time ✅
+
+```bash
+./escli open_point_in_time <INDEX> <KEEP_ALIVE>
+```
+
+Example:
+```bash
+PIT_ID=$(./escli open_point_in_time index-a 5m | jq -r '.id')
+```
+
+---
+
+## Search (with PIT + `search_after`) ✅
+
+```bash
+./escli search <<< '<json_body>'
+```
+
+Example:
+```bash
+./escli search <<< '{
+  "size": 1000,
+  "_source": false,
+  "query": {"match_all": {}},
+  "pit": {"id": "<pit_id>", "keep_alive": "5m"},
+  "sort": [{"_shard_doc": "asc"}],
+  "search_after": [<last_sort_value>]
+}'
+```
+
+Note: when using a PIT, do not pass `--index` — the index is embedded in the PIT id.
+
+---
+
+## Multi-get (`_mget`) ✅
+
+```bash
+./escli mget --index <index> <<< '{"ids": ["id-1", "id-2"]}'
+```
+
+---
+
+## Close Point-in-Time ✅
+
+```bash
+./escli close_point_in_time <<< '{"id": "<pit_id>"}'
+```
