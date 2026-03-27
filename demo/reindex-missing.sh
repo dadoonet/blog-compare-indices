@@ -56,6 +56,22 @@ format_ms() {
     fi
 }
 
+IS_TTY=0; [ -t 1 ] && IS_TTY=1
+_PROG_INIT=0
+
+_progress() {
+    if (( IS_TTY )); then
+        if (( _PROG_INIT == 0 )); then
+            printf "  → %s" "$1"
+            _PROG_INIT=1
+        else
+            printf "\r\033[K  → %s" "$1"
+        fi
+    else
+        info "$1"
+    fi
+}
+
 SECONDS=0   # bash built-in: counts elapsed seconds automatically
 
 # ── Load defaults from .env.sh, then allow CLI overrides ──────────────────────
@@ -235,7 +251,7 @@ while IFS= read -r doc_id; do
         esac
         IDS_PROCESSED=$(( IDS_PROCESSED + ${#BATCH[@]} ))
         PCT=$(( IDS_PROCESSED * 100 / TOTAL_IDS ))
-        info "Batch ${BATCH_NUM} (${IDS_PROCESSED}/${TOTAL_IDS}, ${PCT}%) - ${BATCH_DETAIL}"
+        _progress "Batch ${BATCH_NUM} (${IDS_PROCESSED}/${TOTAL_IDS}, ${PCT}%) - ${BATCH_DETAIL}"
         BATCH=()
     fi
 done < "$INPUT_FILE"
@@ -248,10 +264,11 @@ if (( ${#BATCH[@]} > 0 )); then
         reindex)  process_batch_reindex  "${BATCH[@]}" ;;
     esac
     IDS_PROCESSED=$(( IDS_PROCESSED + ${#BATCH[@]} ))
-    info "Batch ${BATCH_NUM} (${IDS_PROCESSED}/${TOTAL_IDS}, 100%) - ${BATCH_DETAIL}"
+    _progress "Batch ${BATCH_NUM} (${IDS_PROCESSED}/${TOTAL_IDS}, 100%) - ${BATCH_DETAIL}"
 fi
 
 # ── Summary ───────────────────────────────────────────────────────────────────
+(( IS_TTY && _PROG_INIT )) && printf "\n"
 echo ""
 log "Re-indexing complete."
 printf "  %-38s %d\n" "IDs read from input file:"              "$TOTAL_IDS"

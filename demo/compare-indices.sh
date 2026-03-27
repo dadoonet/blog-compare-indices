@@ -60,6 +60,24 @@ format_ms() {
     fi
 }
 
+IS_TTY=0; [ -t 1 ] && IS_TTY=1
+_PROG_INIT=0
+
+# In TTY mode: overwrite the current line in place.
+# In non-TTY mode (pipe/redirect): print normally with a newline.
+_progress() {
+    if (( IS_TTY )); then
+        if (( _PROG_INIT == 0 )); then
+            printf "  → %s" "$1"
+            _PROG_INIT=1
+        else
+            printf "\r\033[K  → %s" "$1"
+        fi
+    else
+        info "$1"
+    fi
+}
+
 SECONDS=0   # bash built-in: counts elapsed seconds automatically
 
 # ── Load defaults from .env.sh, then allow CLI overrides ──────────────────────
@@ -194,7 +212,7 @@ while true; do
     TOTAL_MGET_MS=$(( TOTAL_MGET_MS + MGET_MS ))
 
     PCT=$(( TOTAL_CHECKED * 100 / COUNT_A ))
-    info "Page ${PAGE} (${TOTAL_CHECKED}/${COUNT_A}, ${PCT}%) - ⏳ search: $(format_ms $SEARCH_MS), mget: $(format_ms $MGET_MS)"
+    _progress "Page ${PAGE} (${TOTAL_CHECKED}/${COUNT_A}, ${PCT}%) - ⏳ search: $(format_ms $SEARCH_MS), mget: $(format_ms $MGET_MS)"
 
     # Extract IDs where found == false
     MISSING_IDS=$(echo "$MGET_RESPONSE" | jq -r '.docs[] | select(.found == false) | ._id')
@@ -206,6 +224,7 @@ while true; do
 done
 
 # ── 5. Summary ────────────────────────────────────────────────────────────────
+(( IS_TTY && _PROG_INIT )) && printf "\n"
 echo ""
 log "Comparison complete."
 printf "  %-38s %d\n" "Total documents in ${INDEX_A}:"       "$COUNT_A"

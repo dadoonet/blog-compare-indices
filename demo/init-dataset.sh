@@ -56,6 +56,8 @@ format_ms() {
     fi
 }
 
+IS_TTY=0; [ -t 1 ] && IS_TTY=1
+
 SECONDS=0   # bash built-in: counts elapsed seconds automatically
 
 ESCLI_BIN="${SCRIPT_DIR}/escli"
@@ -147,11 +149,42 @@ BATCH_START_B=$(now_ms)
 TOTAL_BUILD_A=0; TOTAL_INDEX_A=0; BATCH_COUNT_A=0
 TOTAL_BUILD_B=0; TOTAL_INDEX_B=0; BATCH_COUNT_B=0
 
+# In-place two-line progress (TTY only).
+# _PROG_A / _PROG_B hold the current status string for each index.
+# _prog_draw prints both lines; on subsequent calls it moves the cursor up and rewrites.
+_PROG_INIT=0
+_PROG_A="building first batch..."
+_PROG_B="building first batch..."
+
+_prog_draw() {
+    if (( _PROG_INIT == 0 )); then
+        printf "  → %-12s %s\n" "${INDEX_A}:" "$_PROG_A"
+        printf "  → %-12s %s\n" "${INDEX_B}:" "$_PROG_B"
+        _PROG_INIT=1
+    else
+        printf "\033[2A\r"
+        printf "\033[2K  → %-12s %s\n" "${INDEX_A}:" "$_PROG_A"
+        printf "\033[2K  → %-12s %s\n" "${INDEX_B}:" "$_PROG_B"
+    fi
+}
+
+_show_a() {
+    if (( IS_TTY )); then _PROG_A="$1"; _prog_draw
+    else info "${INDEX_A}: $1"; fi
+}
+
+_show_b() {
+    if (( IS_TTY )); then _PROG_B="$1"; _prog_draw
+    else info "${INDEX_B}: $1"; fi
+}
+
 # Open file descriptors once for the entire loop.
 # Writing via >&3 / >&4 avoids reopening the file on every append (>>),
 # which was causing most of the I/O overhead.
 exec 3>"$BULK_A"
 exec 4>"$BULK_B"
+
+(( IS_TTY )) && _prog_draw   # print initial progress lines before the loop starts
 
 # for (( )) avoids the $(seq ...) subshell
 for (( i=1; i<=NUM_DOCS; i++ )); do
@@ -199,7 +232,7 @@ for (( i=1; i<=NUM_DOCS; i++ )); do
         flush_bulk "$BULK_A"
         INDEX_TIME=$(( $(now_ms) - INDEX_START ))
         PCT=$(( COUNT_A * 100 / NUM_DOCS ))
-        info "Indexing batch into ${INDEX_A} (${COUNT_A}/${NUM_DOCS}, ${PCT}%) - ⏳ $(format_ms $BUILD_TIME) to build, $(format_ms $INDEX_TIME) to index"
+        _show_a "(${COUNT_A}/${NUM_DOCS}, ${PCT}%) - ⏳ $(format_ms $BUILD_TIME) build, $(format_ms $INDEX_TIME) index"
         TOTAL_BUILD_A=$(( TOTAL_BUILD_A + BUILD_TIME ))
         TOTAL_INDEX_A=$(( TOTAL_INDEX_A + INDEX_TIME ))
         BATCH_COUNT_A=$(( BATCH_COUNT_A + 1 ))
@@ -214,7 +247,7 @@ for (( i=1; i<=NUM_DOCS; i++ )); do
         flush_bulk "$BULK_B"
         INDEX_TIME=$(( $(now_ms) - INDEX_START ))
         PCT=$(( (COUNT_B + COUNT_SKIP) * 100 / NUM_DOCS ))
-        info "Indexing batch into ${INDEX_B} (${COUNT_B}/${NUM_DOCS}, ${PCT}%) - ⏳ $(format_ms $BUILD_TIME) to build, $(format_ms $INDEX_TIME) to index"
+        _show_b "(${COUNT_B}/${NUM_DOCS}, ${PCT}%) - ⏳ $(format_ms $BUILD_TIME) build, $(format_ms $INDEX_TIME) index"
         TOTAL_BUILD_B=$(( TOTAL_BUILD_B + BUILD_TIME ))
         TOTAL_INDEX_B=$(( TOTAL_INDEX_B + INDEX_TIME ))
         BATCH_COUNT_B=$(( BATCH_COUNT_B + 1 ))
@@ -234,7 +267,7 @@ if (( BATCH_A > 0 )); then
     INDEX_START=$(now_ms)
     flush_bulk "$BULK_A"
     INDEX_TIME=$(( $(now_ms) - INDEX_START ))
-    info "Indexing final batch into ${INDEX_A} (${COUNT_A}/${NUM_DOCS}, 100%) - ⏳ $(format_ms $BUILD_TIME) to build, $(format_ms $INDEX_TIME) to index"
+    _show_a "(${COUNT_A}/${NUM_DOCS}, 100%) - ⏳ $(format_ms $BUILD_TIME) build, $(format_ms $INDEX_TIME) index"
     TOTAL_BUILD_A=$(( TOTAL_BUILD_A + BUILD_TIME ))
     TOTAL_INDEX_A=$(( TOTAL_INDEX_A + INDEX_TIME ))
     BATCH_COUNT_A=$(( BATCH_COUNT_A + 1 ))
@@ -244,7 +277,7 @@ if (( BATCH_B > 0 )); then
     INDEX_START=$(now_ms)
     flush_bulk "$BULK_B"
     INDEX_TIME=$(( $(now_ms) - INDEX_START ))
-    info "Indexing final batch into ${INDEX_B} (${COUNT_B}/${NUM_DOCS}, 100%) - ⏳ $(format_ms $BUILD_TIME) to build, $(format_ms $INDEX_TIME) to index"
+    _show_b "(${COUNT_B}/${NUM_DOCS}, 100%) - ⏳ $(format_ms $BUILD_TIME) build, $(format_ms $INDEX_TIME) index"
     TOTAL_BUILD_B=$(( TOTAL_BUILD_B + BUILD_TIME ))
     TOTAL_INDEX_B=$(( TOTAL_INDEX_B + INDEX_TIME ))
     BATCH_COUNT_B=$(( BATCH_COUNT_B + 1 ))
@@ -253,6 +286,7 @@ fi
 rm -rf "$TMPDIR_BULK"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
+(( IS_TTY && _PROG_INIT )) && printf "\n"   # move past the two progress lines
 echo ""
 log "Indexing complete."
 printf "  %-36s %d\n"   "Documents generated:"             "$NUM_DOCS"
