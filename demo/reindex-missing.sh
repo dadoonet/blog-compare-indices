@@ -145,7 +145,7 @@ TOTAL_IDS=$(wc -l < "$INPUT_FILE" | tr -d ' ')
 
 log "Re-indexing ${TOTAL_IDS} missing document(s) from ${INDEX_A} into ${INDEX_B}..."
 log "Strategy: ${STRATEGY} | Batch size: ${BATCH_SIZE}"
-echo ""
+(( IS_TTY )) || echo ""
 
 # ── Process a batch of IDs — mgetbulk strategy ────────────────────────────────
 # Fetches documents from index-a via _mget, then bulk-indexes them into index-b.
@@ -268,8 +268,7 @@ if (( ${#BATCH[@]} > 0 )); then
 fi
 
 # ── Summary ───────────────────────────────────────────────────────────────────
-(( IS_TTY && _PROG_INIT )) && printf "\n"
-echo ""
+(( IS_TTY && _PROG_INIT )) && printf "\r\033[K" || echo ""
 log "Re-indexing complete."
 printf "  %-38s %d\n" "IDs read from input file:"              "$TOTAL_IDS"
 printf "  %-38s %d\n" "Documents re-indexed into ${INDEX_B}:"  "$REINDEXED_TOTAL"

@@ -286,8 +286,7 @@ fi
 rm -rf "$TMPDIR_BULK"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
-(( IS_TTY && _PROG_INIT )) && printf "\n"   # move past the two progress lines
-echo ""
+(( IS_TTY && _PROG_INIT )) && printf "\033[2A\r\033[J" || echo ""
 log "Indexing complete."
 printf "  %-36s %d\n"   "Documents generated:"             "$NUM_DOCS"
 printf "  %-36s %d\n"   "Indexed into ${INDEX_A}:"         "$COUNT_A"

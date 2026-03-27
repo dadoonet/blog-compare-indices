@@ -147,6 +147,7 @@ trap close_pit EXIT
 
 # ── 3. Paginate through index-a using search_after ────────────────────────────
 log "Scanning ${INDEX_A} in batches of ${BATCH_SIZE}..."
+(( IS_TTY )) || echo ""
 
 OUTPUT_PATH="${SCRIPT_DIR}/${OUTPUT_FILE}"
 > "$OUTPUT_PATH"     # create or truncate the output file
@@ -224,8 +225,7 @@ while true; do
 done
 
 # ── 5. Summary ────────────────────────────────────────────────────────────────
-(( IS_TTY && _PROG_INIT )) && printf "\n"
-echo ""
+(( IS_TTY && _PROG_INIT )) && printf "\r\033[K" || echo ""
 log "Comparison complete."
 printf "  %-38s %d\n" "Total documents in ${INDEX_A}:"       "$COUNT_A"
 printf "  %-38s %d\n" "Total documents in ${INDEX_B}:"       "$COUNT_B"
