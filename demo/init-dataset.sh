@@ -162,25 +162,22 @@ exec 4>"$BULK_B"
 # for (( )) avoids the $(seq ...) subshell
 for (( i=1; i<=NUM_DOCS; i++ )); do
 
-    # printf -v writes directly into the variable — no fork, unlike $(printf ...)
-    printf -v DOC_ID "id-%06d" "$i"
-
     VALUE=$(( RANDOM % 1000 ))
     CATEGORY=${CATEGORIES[$(( RANDOM % ${#CATEGORIES[@]} ))]}
     STATUS=${STATUSES[$(( RANDOM % ${#STATUSES[@]} ))]}
     TAG1=${TAGS[$(( RANDOM % ${#TAGS[@]} ))]}
     TAG2=${TAGS[$(( RANDOM % ${#TAGS[@]} ))]}
     SCORE="${RANDOM: -2}.${RANDOM: -2}"
-    MONTH=$(( ((i - 1) / 28 % 12) + 1 ))
-    DAY=$(( ((i - 1) % 28) + 1 ))
-    printf -v CREATED_AT "2024-%02d-%02dT00:00:00Z" "$MONTH" "$DAY"
 
+    # DOC_ID and CREATED_AT are inlined directly into the format string,
+    # eliminating two printf -v calls per iteration (saves ~2M calls over 1M docs).
     printf -v DOC \
-        '{"title":"Document %s","category":"%s","status":"%s","value":%d,"score":"%s","tags":["%s","%s"],"created_at":"%s"}' \
-        "$DOC_ID" "$CATEGORY" "$STATUS" "$VALUE" "$SCORE" "$TAG1" "$TAG2" "$CREATED_AT"
+        '{"title":"Document id-%06d","category":"%s","status":"%s","value":%d,"score":"%s","tags":["%s","%s"],"created_at":"2024-%02d-%02dT00:00:00Z"}' \
+        "$i" "$CATEGORY" "$STATUS" "$VALUE" "$SCORE" "$TAG1" "$TAG2" \
+        "$(( ((i - 1) / 28 % 12) + 1 ))" "$(( ((i - 1) % 28) + 1 ))"
 
     # index-a always receives every document
-    printf '{"index":{"_index":"%s","_id":"%s"}}\n%s\n' "$INDEX_A" "$DOC_ID" "$DOC" >&3
+    printf '{"index":{"_index":"%s","_id":"id-%06d"}}\n%s\n' "$INDEX_A" "$i" "$DOC" >&3
     COUNT_A=$(( COUNT_A + 1 ))
     BATCH_A=$(( BATCH_A + 1 ))
 
@@ -188,7 +185,7 @@ for (( i=1; i<=NUM_DOCS; i++ )); do
     # (RANDOM % 100) yields values 0–99 uniformly; values below MISS_RATE trigger a skip.
     # This ensures misses are scattered uniformly, not grouped in a block.
     if (( RANDOM % 100 >= MISS_RATE )); then
-        printf '{"index":{"_index":"%s","_id":"%s"}}\n%s\n' "$INDEX_B" "$DOC_ID" "$DOC" >&4
+        printf '{"index":{"_index":"%s","_id":"id-%06d"}}\n%s\n' "$INDEX_B" "$i" "$DOC" >&4
         COUNT_B=$(( COUNT_B + 1 ))
         BATCH_B=$(( BATCH_B + 1 ))
     else
