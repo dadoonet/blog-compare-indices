@@ -206,7 +206,7 @@ for (( i=1; i<=NUM_DOCS; i++ )); do
         flush_bulk "$BULK_A"
         INDEX_TIME=$(( $(now_ms) - INDEX_START ))
         _show_d "$(progress_bar $COUNT_A $NUM_DOCS) - ⏳ $(format_ms $BUILD_TIME)"
-        _show_a "$(progress_bar $COUNT_A $NUM_DOCS) - ⏳ $(format_ms $WRITE_TIME) write, $(format_ms $INDEX_TIME) index"
+        _show_a "$(progress_bar $COUNT_A $NUM_DOCS) - ⏳ $(format_ms $INDEX_TIME)"
         TOTAL_BUILD=$(( TOTAL_BUILD + BUILD_TIME ))
         BATCH_COUNT_BUILD=$(( BATCH_COUNT_BUILD + 1 ))
         TOTAL_WRITE_A=$(( TOTAL_WRITE_A + WRITE_TIME ))
@@ -222,7 +222,7 @@ for (( i=1; i<=NUM_DOCS; i++ )); do
         INDEX_START=$(now_ms)
         flush_bulk "$BULK_B"
         INDEX_TIME=$(( $(now_ms) - INDEX_START ))
-        _show_b "$(progress_bar $(( COUNT_B + COUNT_SKIP )) $NUM_DOCS) - ⏳ $(format_ms $WRITE_TIME) write, $(format_ms $INDEX_TIME) index"
+        _show_b "$(progress_bar $(( COUNT_B + COUNT_SKIP )) $NUM_DOCS) - ⏳ $(format_ms $INDEX_TIME)"
         TOTAL_WRITE_B=$(( TOTAL_WRITE_B + WRITE_TIME ))
         TOTAL_INDEX_B=$(( TOTAL_INDEX_B + INDEX_TIME ))
         BATCH_COUNT_B=$(( BATCH_COUNT_B + 1 ))
@@ -242,7 +242,7 @@ if (( BATCH_A > 0 )); then
     flush_bulk "$BULK_A"
     INDEX_TIME=$(( $(now_ms) - INDEX_START ))
     _show_d "$(progress_bar $COUNT_A $NUM_DOCS) - ⏳ $(format_ms $BUILD_TIME)"
-    _show_a "$(progress_bar $COUNT_A $NUM_DOCS) - ⏳ $(format_ms $WRITE_TIME) write, $(format_ms $INDEX_TIME) index"
+    _show_a "$(progress_bar $COUNT_A $NUM_DOCS) - ⏳ $(format_ms $INDEX_TIME)"
     TOTAL_BUILD=$(( TOTAL_BUILD + BUILD_TIME ))
     BATCH_COUNT_BUILD=$(( BATCH_COUNT_BUILD + 1 ))
     TOTAL_WRITE_A=$(( TOTAL_WRITE_A + WRITE_TIME ))
@@ -257,7 +257,7 @@ if (( BATCH_B > 0 )); then
     INDEX_START=$(now_ms)
     flush_bulk "$BULK_B"
     INDEX_TIME=$(( $(now_ms) - INDEX_START ))
-    _show_b "$(progress_bar $(( COUNT_B + COUNT_SKIP )) $NUM_DOCS) - ⏳ $(format_ms $WRITE_TIME) write, $(format_ms $INDEX_TIME) index"
+    _show_b "$(progress_bar $(( COUNT_B + COUNT_SKIP )) $NUM_DOCS) - ⏳ $(format_ms $INDEX_TIME)"
     TOTAL_WRITE_B=$(( TOTAL_WRITE_B + WRITE_TIME ))
     TOTAL_INDEX_B=$(( TOTAL_INDEX_B + INDEX_TIME ))
     BATCH_COUNT_B=$(( BATCH_COUNT_B + 1 ))
