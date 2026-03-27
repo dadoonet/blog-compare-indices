@@ -150,7 +150,7 @@ fi
 if $NEED_GENERATE; then
     log "Generating ${NUM_DOCS} documents (miss rate: ${MISS_RATE}%)..."
 
-    GEN_START=$(( ${EPOCHREALTIME/[.,]/} / 1000 ))
+    GEN_START=$(now_ms)
 
     # Open FDs once — avoids reopening the file on every iteration
     exec 3>"$BULK_A_CACHE"
@@ -178,7 +178,7 @@ if $NEED_GENERATE; then
 
         # Refresh progress display every BULK_BATCH_SIZE docs
         if (( i % BULK_BATCH_SIZE == 0 )); then
-            _GEN_MS=$(( ${EPOCHREALTIME/[.,]/} / 1000 - GEN_START ))
+            _GEN_MS=$(( $(now_ms) - GEN_START ))
             _show_d "$(progress_bar $i $NUM_DOCS) - ⏳ $(format_ms $_GEN_MS)"
         fi
     done
@@ -186,7 +186,7 @@ if $NEED_GENERATE; then
     exec 3>&-
     exec 4>&-
 
-    GEN_MS=$(( ${EPOCHREALTIME/[.,]/} / 1000 - GEN_START ))
+    GEN_MS=$(( $(now_ms) - GEN_START ))
     _show_d "$(progress_bar $NUM_DOCS $NUM_DOCS) - ✓ generated in $(format_ms $GEN_MS)"
 fi
 
