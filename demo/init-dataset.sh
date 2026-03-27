@@ -69,7 +69,13 @@ delete_index() {
 # ── Load employee dataset into memory ─────────────────────────────────────────
 DATASET_FILE="${SCRIPT_DIR}/dataset/employees.ndjson"
 [ -f "$DATASET_FILE" ] || die "Dataset not found: ${DATASET_FILE}. Run ./setup.sh first."
-mapfile -t EMPLOYEES < "$DATASET_FILE"
+EMPLOYEES=()
+if (( BASH_VERSINFO[0] >= 4 )); then
+    mapfile -t EMPLOYEES < "$DATASET_FILE"
+else
+    # mapfile is bash 4+; fall back to a read loop for bash 3.x (macOS system bash)
+    while IFS= read -r line; do EMPLOYEES+=("$line"); done < "$DATASET_FILE"
+fi
 EMPLOYEE_COUNT=${#EMPLOYEES[@]}
 info "Loaded ${EMPLOYEE_COUNT} employee records from $(basename "$DATASET_FILE")"
 
