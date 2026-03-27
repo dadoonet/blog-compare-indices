@@ -68,7 +68,7 @@ if ! $SKIP_START_LOCAL; then
     else
         log "Downloading and running elastic/start-local..."
         # start-local creates ./elastic-start-local/ relative to the working directory
-        (cd "$SCRIPT_DIR" && curl -fsSL https://elastic.co/start-local | sh)
+        (cd "$SCRIPT_DIR" && curl -fsSL https://elastic.co/start-local | sh -s -- --esonly)
     fi
 
     # ── 3. Extract connection details from start-local .env ───────────────────
@@ -128,7 +128,7 @@ if ! $SKIP_ESCLI; then
         esac
         DOWNLOAD_URL="https://github.com/Anaethelion/escli-rs/releases/download/${ESCLI_VERSION}/${BINARY_NAME}"
 
-        log "Downloading escli-rs ${ESCLI_VERSION}..."
+        log "Downloading escli-rs ${ESCLI_VERSION} from ${DOWNLOAD_URL}..."
         if curl -fsSL "$DOWNLOAD_URL" -o "$ESCLI_BINARY"; then
             chmod +x "$ESCLI_BINARY"
             # Remove macOS quarantine flag for unsigned binaries
