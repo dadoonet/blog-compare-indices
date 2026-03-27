@@ -60,6 +60,17 @@ format_ms() {
     fi
 }
 
+progress_bar() {
+    local current=$1 total=$2 width=25
+    local pct=$(( current * 100 / total ))
+    local filled=$(( current * width / total ))
+    local empty=$(( width - filled ))
+    local bar="" i
+    for (( i=0; i<filled; i++ )); do bar+="█"; done
+    for (( i=0; i<empty;  i++ )); do bar+="░"; done
+    printf "[%s] %3d%%" "$bar" "$pct"
+}
+
 IS_TTY=0; [ -t 1 ] && IS_TTY=1
 _PROG_INIT=0
 
@@ -212,8 +223,7 @@ while true; do
     MGET_MS=$(( $(now_ms) - MGET_START ))
     TOTAL_MGET_MS=$(( TOTAL_MGET_MS + MGET_MS ))
 
-    PCT=$(( TOTAL_CHECKED * 100 / COUNT_A ))
-    _progress "Page ${PAGE} (${TOTAL_CHECKED}/${COUNT_A}, ${PCT}%) - ⏳ search: $(format_ms $SEARCH_MS), mget: $(format_ms $MGET_MS)"
+    _progress "Page ${PAGE} $(progress_bar $TOTAL_CHECKED $COUNT_A) - ⏳ search: $(format_ms $SEARCH_MS), mget: $(format_ms $MGET_MS)"
 
     # Extract IDs where found == false
     MISSING_IDS=$(echo "$MGET_RESPONSE" | jq -r '.docs[] | select(.found == false) | ._id')

@@ -56,6 +56,17 @@ format_ms() {
     fi
 }
 
+progress_bar() {
+    local current=$1 total=$2 width=25
+    local pct=$(( current * 100 / total ))
+    local filled=$(( current * width / total ))
+    local empty=$(( width - filled ))
+    local bar="" i
+    for (( i=0; i<filled; i++ )); do bar+="█"; done
+    for (( i=0; i<empty;  i++ )); do bar+="░"; done
+    printf "[%s] %3d%%" "$bar" "$pct"
+}
+
 IS_TTY=0; [ -t 1 ] && IS_TTY=1
 _PROG_INIT=0
 
@@ -250,8 +261,7 @@ while IFS= read -r doc_id; do
             reindex)  process_batch_reindex  "${BATCH[@]}" ;;
         esac
         IDS_PROCESSED=$(( IDS_PROCESSED + ${#BATCH[@]} ))
-        PCT=$(( IDS_PROCESSED * 100 / TOTAL_IDS ))
-        _progress "Batch ${BATCH_NUM} (${IDS_PROCESSED}/${TOTAL_IDS}, ${PCT}%) - ${BATCH_DETAIL}"
+        _progress "Batch ${BATCH_NUM} $(progress_bar $IDS_PROCESSED $TOTAL_IDS) - ${BATCH_DETAIL}"
         BATCH=()
     fi
 done < "$INPUT_FILE"
@@ -264,7 +274,7 @@ if (( ${#BATCH[@]} > 0 )); then
         reindex)  process_batch_reindex  "${BATCH[@]}" ;;
     esac
     IDS_PROCESSED=$(( IDS_PROCESSED + ${#BATCH[@]} ))
-    _progress "Batch ${BATCH_NUM} (${IDS_PROCESSED}/${TOTAL_IDS}, 100%) - ${BATCH_DETAIL}"
+    _progress "Batch ${BATCH_NUM} $(progress_bar $IDS_PROCESSED $TOTAL_IDS) - ${BATCH_DETAIL}"
 fi
 
 # ── Summary ───────────────────────────────────────────────────────────────────

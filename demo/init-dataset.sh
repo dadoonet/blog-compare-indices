@@ -56,6 +56,17 @@ format_ms() {
     fi
 }
 
+progress_bar() {
+    local current=$1 total=$2 width=25
+    local pct=$(( current * 100 / total ))
+    local filled=$(( current * width / total ))
+    local empty=$(( width - filled ))
+    local bar="" i
+    for (( i=0; i<filled; i++ )); do bar+="█"; done
+    for (( i=0; i<empty;  i++ )); do bar+="░"; done
+    printf "[%s] %3d%%" "$bar" "$pct"
+}
+
 IS_TTY=0; [ -t 1 ] && IS_TTY=1
 
 SECONDS=0   # bash built-in: counts elapsed seconds automatically
@@ -231,8 +242,7 @@ for (( i=1; i<=NUM_DOCS; i++ )); do
         INDEX_START=$(now_ms)
         flush_bulk "$BULK_A"
         INDEX_TIME=$(( $(now_ms) - INDEX_START ))
-        PCT=$(( COUNT_A * 100 / NUM_DOCS ))
-        _show_a "(${COUNT_A}/${NUM_DOCS}, ${PCT}%) - ⏳ $(format_ms $BUILD_TIME) build, $(format_ms $INDEX_TIME) index"
+        _show_a "$(progress_bar $COUNT_A $NUM_DOCS) - ⏳ $(format_ms $BUILD_TIME) build, $(format_ms $INDEX_TIME) index"
         TOTAL_BUILD_A=$(( TOTAL_BUILD_A + BUILD_TIME ))
         TOTAL_INDEX_A=$(( TOTAL_INDEX_A + INDEX_TIME ))
         BATCH_COUNT_A=$(( BATCH_COUNT_A + 1 ))
@@ -246,8 +256,7 @@ for (( i=1; i<=NUM_DOCS; i++ )); do
         INDEX_START=$(now_ms)
         flush_bulk "$BULK_B"
         INDEX_TIME=$(( $(now_ms) - INDEX_START ))
-        PCT=$(( (COUNT_B + COUNT_SKIP) * 100 / NUM_DOCS ))
-        _show_b "(${COUNT_B}/${NUM_DOCS}, ${PCT}%) - ⏳ $(format_ms $BUILD_TIME) build, $(format_ms $INDEX_TIME) index"
+        _show_b "$(progress_bar $(( COUNT_B + COUNT_SKIP )) $NUM_DOCS) - ⏳ $(format_ms $BUILD_TIME) build, $(format_ms $INDEX_TIME) index"
         TOTAL_BUILD_B=$(( TOTAL_BUILD_B + BUILD_TIME ))
         TOTAL_INDEX_B=$(( TOTAL_INDEX_B + INDEX_TIME ))
         BATCH_COUNT_B=$(( BATCH_COUNT_B + 1 ))
@@ -267,7 +276,7 @@ if (( BATCH_A > 0 )); then
     INDEX_START=$(now_ms)
     flush_bulk "$BULK_A"
     INDEX_TIME=$(( $(now_ms) - INDEX_START ))
-    _show_a "(${COUNT_A}/${NUM_DOCS}, 100%) - ⏳ $(format_ms $BUILD_TIME) build, $(format_ms $INDEX_TIME) index"
+    _show_a "$(progress_bar $COUNT_A $NUM_DOCS) - ⏳ $(format_ms $BUILD_TIME) build, $(format_ms $INDEX_TIME) index"
     TOTAL_BUILD_A=$(( TOTAL_BUILD_A + BUILD_TIME ))
     TOTAL_INDEX_A=$(( TOTAL_INDEX_A + INDEX_TIME ))
     BATCH_COUNT_A=$(( BATCH_COUNT_A + 1 ))
@@ -277,7 +286,7 @@ if (( BATCH_B > 0 )); then
     INDEX_START=$(now_ms)
     flush_bulk "$BULK_B"
     INDEX_TIME=$(( $(now_ms) - INDEX_START ))
-    _show_b "(${COUNT_B}/${NUM_DOCS}, 100%) - ⏳ $(format_ms $BUILD_TIME) build, $(format_ms $INDEX_TIME) index"
+    _show_b "$(progress_bar $(( COUNT_B + COUNT_SKIP )) $NUM_DOCS) - ⏳ $(format_ms $BUILD_TIME) build, $(format_ms $INDEX_TIME) index"
     TOTAL_BUILD_B=$(( TOTAL_BUILD_B + BUILD_TIME ))
     TOTAL_INDEX_B=$(( TOTAL_INDEX_B + INDEX_TIME ))
     BATCH_COUNT_B=$(( BATCH_COUNT_B + 1 ))
