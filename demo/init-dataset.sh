@@ -127,7 +127,17 @@ _show_b() {
     else info "${INDEX_B}: $1"; fi
 }
 
-(( IS_TTY )) && _prog_draw   # print initial progress lines
+# ── Single-line in-place progress (used during sequential indexing) ────────────
+_INLINE_INIT=0
+_show_inline() {
+    if (( IS_TTY )); then
+        if (( _INLINE_INIT == 0 )); then
+            printf "  → %s" "$1"; _INLINE_INIT=1
+        else
+            printf "\r\033[K  → %s" "$1"
+        fi
+    else info "$1"; fi
+}
 
 # ── 1. Check cache validity ────────────────────────────────────────────────────
 NEED_GENERATE=true
@@ -137,7 +147,7 @@ if [[ -f "$BULK_A_CACHE" && -f "$BULK_B_CACHE" ]]; then
         COUNT_A=$NUM_DOCS
         COUNT_B=$(( $(wc -l < "$BULK_B_CACHE" | tr -d ' ') / 2 ))
         COUNT_SKIP=$(( NUM_DOCS - COUNT_B ))
-        _show_d "cache valid — ${NUM_DOCS} docs, skipping generation"
+        log "Cache valid — ${NUM_DOCS} docs, skipping generation."
         NEED_GENERATE=false
     else
         warn "Cache mismatch (expected ${EXPECTED_LINES_A} lines, got ${ACTUAL_LINES}). Regenerating..."
@@ -151,6 +161,8 @@ if $NEED_GENERATE; then
     log "Generating ${NUM_DOCS} documents (miss rate: ${MISS_RATE}%)..."
 
     GEN_START=$(now_ms)
+    _PROG_D="generating..."
+    (( IS_TTY )) && _prog_draw   # start the 3-line block only during generation
 
     # Open FDs once — avoids reopening the file on every iteration
     exec 3>"$BULK_A_CACHE"
@@ -188,6 +200,13 @@ if $NEED_GENERATE; then
 
     GEN_MS=$(( $(now_ms) - GEN_START ))
     _show_d "$(progress_bar $NUM_DOCS $NUM_DOCS) - ✓ generated in $(format_ms $GEN_MS)"
+
+    # Erase the progress block so subsequent log lines appear cleanly
+    (( IS_TTY && _PROG_INIT )) && printf "\033[3A\r\033[J"
+    _PROG_INIT=0
+    _PROG_A="waiting..."
+    _PROG_B="waiting..."
+    log "Generated ${NUM_DOCS} documents in $(format_ms $GEN_MS)."
 fi
 
 # ── 3. Delete existing indices ─────────────────────────────────────────────────
@@ -225,24 +244,28 @@ _load_with_progress() {
 }
 
 # ── index-a ────────────────────────────────────────────────────────────────────
-log "Indexing ${COUNT_A} documents into ${INDEX_A}..."
+log "Indexing ${COUNT_A} docs into ${INDEX_A}..."
+_INLINE_INIT=0
 T_A=$(now_ms)
-_load_with_progress "$COUNT_A" _show_a \
+_load_with_progress "$COUNT_A" _show_inline \
     "${ESCLI_BIN}" utils load --index "$INDEX_A" --size "$BULK_BATCH_SIZE" "$BULK_A_CACHE"
 TOTAL_INDEX_A=$(( $(now_ms) - T_A ))
-_show_a "✅ ${COUNT_A} docs in $(format_ms $TOTAL_INDEX_A)"
+(( IS_TTY && _INLINE_INIT )) && printf "\r\033[K"
+log "Indexing complete. (${COUNT_A} docs in $(format_ms $TOTAL_INDEX_A))"
 
 # ── index-b ────────────────────────────────────────────────────────────────────
-log "Indexing ${COUNT_B} documents into ${INDEX_B}..."
+log "Indexing ${COUNT_B} docs into ${INDEX_B}..."
+_INLINE_INIT=0
 T_B=$(now_ms)
-_load_with_progress "$COUNT_B" _show_b \
+_load_with_progress "$COUNT_B" _show_inline \
     "${ESCLI_BIN}" utils load --index "$INDEX_B" --size "$BULK_BATCH_SIZE" "$BULK_B_CACHE"
 TOTAL_INDEX_B=$(( $(now_ms) - T_B ))
-_show_b "✅ ${COUNT_B} docs in $(format_ms $TOTAL_INDEX_B)"
+(( IS_TTY && _INLINE_INIT )) && printf "\r\033[K"
+log "Indexing complete. (${COUNT_B} docs in $(format_ms $TOTAL_INDEX_B))"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
-(( IS_TTY && _PROG_INIT )) && printf "\033[3A\r\033[J" || echo ""
-log "Indexing complete."
+echo ""
+log "Summary."
 printf "  %-36s %d\n"   "Documents generated:"             "$NUM_DOCS"
 printf "  %-36s %d\n"   "Indexed into ${INDEX_A}:"         "$COUNT_A"
 printf "  %-36s %d\n"   "Indexed into ${INDEX_B}:"         "$COUNT_B"
