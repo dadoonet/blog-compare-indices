@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # compare-indices.sh — Find documents present in index-a but missing from index-b.
 #
-# Strategy:
-#   1. Run _count on both indices. If counts are equal, there is no point
-#      in doing a full scan (same count does not guarantee identical content,
-#      but a different count is a definite signal that documents are missing).
-#   2. Open a Point-in-Time (PIT) on index-a to get a consistent snapshot.
-#      Documents indexed or deleted after this point will not affect the scan.
-#   3. Paginate through all document IDs in index-a using search_after.
-#      _source is disabled — we only need the _id field.
-#   4. For each page of IDs, batch-check existence in index-b via _mget.
-#   5. Collect missing IDs, write them to a file, and print a summary.
+# Strategies:
+#   querydsl (default)
+#     1. Run _count on both indices to detect a mismatch early.
+#     2. Open a Point-in-Time (PIT) on index-a for a consistent snapshot.
+#     3. Paginate through all document IDs using search_after (_source: false).
+#     4. For each page, batch-check existence in index-b via _mget.
+#     5. Collect missing IDs, write them to a file, and print a summary.
+#
+#   esql
+#     Not yet implemented.
 #
 # Requirements: escli (./escli wrapper), jq
 #
@@ -20,6 +20,7 @@
 #   --batch-size <n>       IDs per search page / _mget call (default: 10000 - can't be more than ES's max_result_window)
 #   --pit-keep-alive <dur> PIT keep-alive duration        (default: 5m)
 #   --output <file>        Output file for missing IDs    (default: missing-ids.txt)
+#   --strategy <name>      Comparison strategy            (default: querydsl)
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -54,6 +55,7 @@ set -a && set +u && source "${SCRIPT_DIR}/.env.sh" && set -u && set +a
 : "${BATCH_SIZE:=10000}"
 : "${PIT_KEEP_ALIVE:=5m}"
 : "${OUTPUT_FILE:=missing-ids.txt}"
+: "${STRATEGY:=querydsl}"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -62,12 +64,19 @@ while [[ $# -gt 0 ]]; do
         --batch-size)      BATCH_SIZE="$2";       shift 2 ;;
         --pit-keep-alive)  PIT_KEEP_ALIVE="$2";   shift 2 ;;
         --output)          OUTPUT_FILE="$2";      shift 2 ;;
+        --strategy)        STRATEGY="$2";         shift 2 ;;
         -h|--help)
-            grep '^# ' "$0" | head -20 | sed 's/^# \?//'
+            grep '^# ' "$0" | head -25 | sed 's/^# \?//'
             exit 0 ;;
         *) die "Unknown option: $1" ;;
     esac
 done
+
+case "$STRATEGY" in
+    querydsl) ;;
+    esql) die "Strategy 'esql' is not yet implemented." ;;
+    *) die "Unknown strategy: ${STRATEGY}. Valid values: querydsl, esql" ;;
+esac
 
 command -v jq >/dev/null || die "jq is required (brew install jq / apt install jq)"
 [ -f "$ESCLI" ]          || die "escli not found at ${ESCLI}. Run ./setup.sh first."
