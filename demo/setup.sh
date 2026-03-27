@@ -137,7 +137,29 @@ if ! $SKIP_ESCLI; then
     fi
 fi
 
-# ── 6. Smoke test ─────────────────────────────────────────────────────────────
+# ── 6. Download sample dataset ────────────────────────────────────────────────
+DATASET_DIR="${SCRIPT_DIR}/dataset"
+EMPLOYEES_FILENAME="employees.ndjson"
+EMPLOYEES_FILE="${DATASET_DIR}/${EMPLOYEES_FILENAME}"
+EMPLOYEES_URL="https://raw.githubusercontent.com/elastic/elasticsearch/main/x-pack/plugin/esql-datasource-ndjson/qa/src/javaRestTest/resources/iceberg-fixtures/standalone/employees.ndjson"
+
+mkdir -p "$DATASET_DIR"
+if [ -f "$EMPLOYEES_FILE" ]; then
+    log "${EMPLOYEES_FILENAME} already present — skipping download."
+else
+    log "Downloading ${EMPLOYEES_FILENAME}..."
+    if curl -fsSL "$EMPLOYEES_URL" -o "$EMPLOYEES_FILE"; then
+        log "${EMPLOYEES_FILENAME} downloaded to ${EMPLOYEES_FILE}."
+    else
+        warn "Failed to download ${EMPLOYEES_FILENAME}. You can retry manually:"
+        warn "  curl -fsSL '${EMPLOYEES_URL}' -o '${EMPLOYEES_FILE}'"
+    fi
+fi
+if [ -f "$EMPLOYEES_FILE" ]; then
+    info "${EMPLOYEES_FILENAME}: $(wc -l < "$EMPLOYEES_FILE" | tr -d ' ') documents"
+fi
+
+# ── 7. Smoke test ─────────────────────────────────────────────────────────────
 if [ -f "${SCRIPT_DIR}/escli" ] && [ -f "${SCRIPT_DIR}/.env.es" ]; then
     log "Testing connection to Elasticsearch..."
     set -a; set +u; source "${SCRIPT_DIR}/.env.sh"; set -u; set +a

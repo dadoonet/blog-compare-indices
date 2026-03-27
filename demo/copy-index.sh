@@ -39,7 +39,12 @@ done
 
 [ -f "$ESCLI" ] || die "escli not found at ${ESCLI}. Run ./setup.sh first."
 
-# ── 1. Delete the target index ─────────────────────────────────────────────────
+# ── 1. Refresh the source index ───────────────────────────────────────────────
+# Ensures all recently indexed documents are visible before the reindex starts.
+log "Refreshing ${COPY_SOURCE}..."
+"$ESCLI" indices refresh --index "$COPY_SOURCE" &>/dev/null
+
+# ── 2. Delete the target index ─────────────────────────────────────────────────
 log "Deleting ${COPY_TARGET}..."
 if "$ESCLI" indices delete "$COPY_TARGET" &>/dev/null; then
     info "Deleted existing index: ${COPY_TARGET}"
@@ -47,7 +52,7 @@ else
     info "Index ${COPY_TARGET} did not exist — nothing to delete"
 fi
 
-# ── 2. Reindex source → target ─────────────────────────────────────────────────
+# ── 3. Reindex source → target ─────────────────────────────────────────────────
 log "Copying ${COPY_SOURCE} → ${COPY_TARGET}..."
 
 REINDEX_BODY=$(jq -n \

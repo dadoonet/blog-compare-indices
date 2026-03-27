@@ -5,6 +5,18 @@ JSON bodies are passed via stdin using a here-string (`<<<`).
 
 ---
 
+## Refresh an index ✅
+
+```bash
+./escli indices refresh --index <index>
+```
+
+Forces a refresh so all recently indexed documents are visible to searches.
+Useful before a reindex or comparison to avoid missing documents that are
+not yet in a searchable segment.
+
+---
+
 ## Delete an index ✅
 
 ```bash
@@ -45,17 +57,34 @@ COUNT=$(./escli count --index index-a | jq -r '.count')
 
 ---
 
-## Bulk indexing ✅
+## Load documents from a file ✅
+
+```bash
+# Ingest an NDJSON bulk file (action + document pairs); batching handled internally.
+./escli utils load --size <batch_size> <file.ndjson>
+
+# Ingest an NDJSON bulk file (action + document pairs); batching handled internally. but index is set globally not per action
+./escli utils load --index <index> --size <batch_size> <file.jsonl>
+```
+
+The format is inferred from the file extension (`.ndjson` vs `.json`/`.jsonl`).
+`--size` controls the number of documents per bulk request (default: 500).
+
+---
+
+## Bulk indexing (low-level) ✅
 
 ```bash
 # Pass via stdin — required when escli runs in Docker (no access to host paths)
-./escli bulk --input - < file.ndjson
+# --index sets the target index for all operations in the file,
+# so the action headers only need to contain _id.
+./escli bulk --index <index> --input - < file.ndjson
 ```
 
 The file must follow the Elasticsearch NDJSON bulk format:
 
 ```json
-{"index":{"_index":"my-index","_id":"id-000001"}}
+{"index":{"_id":"id-000001"}}
 {"title":"Document id-000001","value":42}
 ```
 

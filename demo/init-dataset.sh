@@ -9,6 +9,9 @@
 # Document IDs use a zero-padded counter: id-000001, id-000002, …
 # This makes them easy to sort, inspect, and validate manually.
 #
+# Bulk files are cached in dataset/ and reused if the document count matches.
+# Delete dataset/bulk-*.ndjson to force regeneration.
+#
 # Usage: ./init-dataset.sh [options]
 #   --num-docs <n>         Documents to generate         (default: 1000000)
 #   --miss-rate <pct>      % of docs omitted from target (default: 5)
@@ -43,7 +46,7 @@ while [[ $# -gt 0 ]]; do
         --target)          INDEX_B="$2";           shift 2 ;;
         --bulk-batch-size) BULK_BATCH_SIZE="$2";   shift 2 ;;
         -h|--help)
-            grep '^# ' "$0" | head -15 | sed 's/^# \?//'
+            grep '^# ' "$0" | head -18 | sed 's/^# \?//'
             exit 0 ;;
         *) die "Unknown option: $1" ;;
     esac
@@ -63,62 +66,29 @@ delete_index() {
     fi
 }
 
-# Send a bulk NDJSON file to Elasticsearch and truncate the file afterwards.
-# Aborts if the bulk response contains errors.
-flush_bulk() {
-    local file="$1"
-    [ -s "$file" ] || return 0     # nothing to send
+# ── Load employee dataset into memory ─────────────────────────────────────────
+DATASET_FILE="${SCRIPT_DIR}/dataset/employees.ndjson"
+[ -f "$DATASET_FILE" ] || die "Dataset not found: ${DATASET_FILE}. Run ./setup.sh first."
+mapfile -t EMPLOYEES < "$DATASET_FILE"
+EMPLOYEE_COUNT=${#EMPLOYEES[@]}
+info "Loaded ${EMPLOYEE_COUNT} employee records from $(basename "$DATASET_FILE")"
 
-    local response
-    # Pass the file via stdin — the escli Docker container cannot access
-    # host file paths directly, but stdin is forwarded via the -i flag.
-    response=$("${ESCLI_BIN}" bulk --input - < "$file")
+# ── Cache file paths ───────────────────────────────────────────────────────────
+DATASET_DIR="${SCRIPT_DIR}/dataset"
+BULK_A_CACHE="${DATASET_DIR}/bulk-${INDEX_A}.ndjson"
+BULK_B_CACHE="${DATASET_DIR}/bulk-${INDEX_B}.ndjson"
+EXPECTED_LINES_A=$(( NUM_DOCS * 2 ))
 
-    # Fail fast on bulk errors (partial failures are still reported as HTTP 200)
-    if echo "$response" | grep -q '"errors":true'; then
-        die "Bulk indexing errors detected: $(echo "$response" | grep -o '"reason":"[^"]*"' | head -3)"
-    fi
+# ── Counters ───────────────────────────────────────────────────────────────────
+COUNT_A=0
+COUNT_B=0
+COUNT_SKIP=0
 
-    > "$file"    # truncate for the next batch
-}
-
-# ── Vocabulary for random document content ─────────────────────────────────────
-CATEGORIES=("alpha" "beta" "gamma" "delta" "epsilon")
-STATUSES=("active" "inactive" "pending" "archived")
-TAGS=("important" "urgent" "review" "draft" "final" "legacy" "new" "experimental")
-
-# ── 1. Delete existing indices ────────────────────────────────────────────────
-log "Deleting existing indices..."
-delete_index "$INDEX_A"
-delete_index "$INDEX_B"
-
-# ── 2. Generate and index documents ───────────────────────────────────────────
-log "Generating ${NUM_DOCS} documents (miss rate: ${MISS_RATE}%)..."
-
-TMPDIR_BULK=$(mktemp -d)
-BULK_A="${TMPDIR_BULK}/bulk-a.ndjson"
-BULK_B="${TMPDIR_BULK}/bulk-b.ndjson"
-touch "$BULK_A" "$BULK_B"
-
-# Counters
-COUNT_A=0         # docs indexed into index-a
-COUNT_B=0         # docs indexed into index-b
-COUNT_SKIP=0      # docs omitted from index-b
-BATCH_A=0         # docs buffered in current index-a batch
-BATCH_B=0         # docs buffered in current index-b batch
-
-# Per-batch timing (milliseconds)
-BATCH_START_A=$(now_ms)
-BATCH_START_B=$(now_ms)
-TOTAL_BUILD=0;   BATCH_COUNT_BUILD=0
-TOTAL_WRITE_A=0; TOTAL_INDEX_A=0; BATCH_COUNT_A=0
-TOTAL_WRITE_B=0; TOTAL_INDEX_B=0; BATCH_COUNT_B=0
-
-# In-place three-line progress (TTY only).
+# ── In-place three-line progress (TTY only) ────────────────────────────────────
 # _PROG_D / _PROG_A / _PROG_B hold the current status string for each line.
 # _prog_draw prints all three lines; on subsequent calls it moves the cursor up and rewrites.
 _PROG_INIT=0
-_PROG_D="building first batch..."
+_PROG_D="..."
 _PROG_A="waiting..."
 _PROG_B="waiting..."
 
@@ -151,118 +121,118 @@ _show_b() {
     else info "${INDEX_B}: $1"; fi
 }
 
-# Open file descriptors once for the entire loop.
-# Writing via >&3 / >&4 avoids reopening the file on every append (>>),
-# which was causing most of the I/O overhead.
-exec 3>"$BULK_A"
-exec 4>"$BULK_B"
+(( IS_TTY )) && _prog_draw   # print initial progress lines
 
-(( IS_TTY )) && _prog_draw   # print initial progress lines before the loop starts
-
-# for (( )) avoids the $(seq ...) subshell
-for (( i=1; i<=NUM_DOCS; i++ )); do
-
-    VALUE=$(( RANDOM % 1000 ))
-    CATEGORY=${CATEGORIES[$(( RANDOM % ${#CATEGORIES[@]} ))]}
-    STATUS=${STATUSES[$(( RANDOM % ${#STATUSES[@]} ))]}
-    TAG1=${TAGS[$(( RANDOM % ${#TAGS[@]} ))]}
-    TAG2=${TAGS[$(( RANDOM % ${#TAGS[@]} ))]}
-    SCORE="${RANDOM: -2}.${RANDOM: -2}"
-
-    # DOC_ID and CREATED_AT are inlined directly into the format string,
-    # eliminating two printf -v calls per iteration (saves ~2M calls over 1M docs).
-    printf -v DOC \
-        '{"title":"Document id-%06d","category":"%s","status":"%s","value":%d,"score":"%s","tags":["%s","%s"],"created_at":"2024-%02d-%02dT00:00:00Z"}' \
-        "$i" "$CATEGORY" "$STATUS" "$VALUE" "$SCORE" "$TAG1" "$TAG2" \
-        "$(( ((i - 1) / 28 % 12) + 1 ))" "$(( ((i - 1) % 28) + 1 ))"
-
-    # index-a always receives every document
-    printf '{"index":{"_index":"%s","_id":"id-%06d"}}\n%s\n' "$INDEX_A" "$i" "$DOC" >&3
-    COUNT_A=$(( COUNT_A + 1 ))
-    BATCH_A=$(( BATCH_A + 1 ))
-
-    # index-b: each document has a MISS_RATE % probability of being skipped.
-    # (RANDOM % 100) yields values 0–99 uniformly; values below MISS_RATE trigger a skip.
-    # This ensures misses are scattered uniformly, not grouped in a block.
-    if (( RANDOM % 100 >= MISS_RATE )); then
-        printf '{"index":{"_index":"%s","_id":"id-%06d"}}\n%s\n' "$INDEX_B" "$i" "$DOC" >&4
-        COUNT_B=$(( COUNT_B + 1 ))
-        BATCH_B=$(( BATCH_B + 1 ))
+# ── 1. Check cache validity ────────────────────────────────────────────────────
+NEED_GENERATE=true
+if [[ -f "$BULK_A_CACHE" && -f "$BULK_B_CACHE" ]]; then
+    ACTUAL_LINES=$(wc -l < "$BULK_A_CACHE" | tr -d ' ')
+    if (( ACTUAL_LINES == EXPECTED_LINES_A )); then
+        COUNT_A=$NUM_DOCS
+        COUNT_B=$(( $(wc -l < "$BULK_B_CACHE" | tr -d ' ') / 2 ))
+        COUNT_SKIP=$(( NUM_DOCS - COUNT_B ))
+        _show_d "cache valid — ${NUM_DOCS} docs, skipping generation"
+        NEED_GENERATE=false
     else
-        COUNT_SKIP=$(( COUNT_SKIP + 1 ))
+        warn "Cache mismatch (expected ${EXPECTED_LINES_A} lines, got ${ACTUAL_LINES}). Regenerating..."
     fi
+fi
 
-    # Flush when either batch buffer is full.
-    # The FD must be closed before flushing (so the OS flushes its buffer to disk)
-    # and reopened afterwards for the next batch.
-    if (( BATCH_A >= BULK_BATCH_SIZE )); then
-        BUILD_TIME=$(( $(now_ms) - BATCH_START_A ))
-        WRITE_START=$(now_ms); exec 3>&-
-        WRITE_TIME=$(( $(now_ms) - WRITE_START ))
-        INDEX_START=$(now_ms)
-        flush_bulk "$BULK_A"
-        INDEX_TIME=$(( $(now_ms) - INDEX_START ))
-        _show_d "$(progress_bar $COUNT_A $NUM_DOCS) - ⏳ $(format_ms $BUILD_TIME)"
-        _show_a "$(progress_bar $COUNT_A $NUM_DOCS) - ⏳ $(format_ms $INDEX_TIME)"
-        TOTAL_BUILD=$(( TOTAL_BUILD + BUILD_TIME ))
-        BATCH_COUNT_BUILD=$(( BATCH_COUNT_BUILD + 1 ))
-        TOTAL_WRITE_A=$(( TOTAL_WRITE_A + WRITE_TIME ))
-        TOTAL_INDEX_A=$(( TOTAL_INDEX_A + INDEX_TIME ))
-        BATCH_COUNT_A=$(( BATCH_COUNT_A + 1 ))
-        exec 3>"$BULK_A"
-        BATCH_A=0
-        BATCH_START_A=$(now_ms)
-    fi
-    if (( BATCH_B >= BULK_BATCH_SIZE )); then
-        WRITE_START=$(now_ms); exec 4>&-
-        WRITE_TIME=$(( $(now_ms) - WRITE_START ))
-        INDEX_START=$(now_ms)
-        flush_bulk "$BULK_B"
-        INDEX_TIME=$(( $(now_ms) - INDEX_START ))
-        _show_b "$(progress_bar $(( COUNT_B + COUNT_SKIP )) $NUM_DOCS) - ⏳ $(format_ms $INDEX_TIME)"
-        TOTAL_WRITE_B=$(( TOTAL_WRITE_B + WRITE_TIME ))
-        TOTAL_INDEX_B=$(( TOTAL_INDEX_B + INDEX_TIME ))
-        BATCH_COUNT_B=$(( BATCH_COUNT_B + 1 ))
-        exec 4>"$BULK_B"
-        BATCH_B=0
-        BATCH_START_B=$(now_ms)
-    fi
-done
+# ── 2. Generate bulk files (if needed) ────────────────────────────────────────
+# Writes dataset/bulk-{index-a,index-b}.ndjson without making any ES calls.
+# The loop is intentionally lean: one array lookup + two printf writes per doc.
+if $NEED_GENERATE; then
+    log "Generating ${NUM_DOCS} documents (miss rate: ${MISS_RATE}%)..."
 
-# Flush any remaining documents in the buffers.
-# The exec close is done here (not before) so we can measure the write time properly.
-if (( BATCH_A > 0 )); then
-    BUILD_TIME=$(( $(now_ms) - BATCH_START_A ))
-    WRITE_START=$(now_ms); exec 3>&-
-    WRITE_TIME=$(( $(now_ms) - WRITE_START ))
-    INDEX_START=$(now_ms)
-    flush_bulk "$BULK_A"
-    INDEX_TIME=$(( $(now_ms) - INDEX_START ))
-    _show_d "$(progress_bar $COUNT_A $NUM_DOCS) - ⏳ $(format_ms $BUILD_TIME)"
-    _show_a "$(progress_bar $COUNT_A $NUM_DOCS) - ⏳ $(format_ms $INDEX_TIME)"
-    TOTAL_BUILD=$(( TOTAL_BUILD + BUILD_TIME ))
-    BATCH_COUNT_BUILD=$(( BATCH_COUNT_BUILD + 1 ))
-    TOTAL_WRITE_A=$(( TOTAL_WRITE_A + WRITE_TIME ))
-    TOTAL_INDEX_A=$(( TOTAL_INDEX_A + INDEX_TIME ))
-    BATCH_COUNT_A=$(( BATCH_COUNT_A + 1 ))
-else
+    GEN_START=$(( ${EPOCHREALTIME/[.,]/} / 1000 ))
+
+    # Open FDs once — avoids reopening the file on every iteration
+    exec 3>"$BULK_A_CACHE"
+    exec 4>"$BULK_B_CACHE"
+
+    # for (( )) avoids the $(seq ...) subshell
+    for (( i=1; i<=NUM_DOCS; i++ )); do
+
+        # Pick a random employee document from the in-memory array.
+        # The bulk header is built once — it's identical for both indices.
+        DOC="${EMPLOYEES[$(( RANDOM % EMPLOYEE_COUNT ))]}"
+        printf -v HEADER '{"index":{"_id":"id-%06d"}}' "$i"
+
+        printf '%s\n%s\n' "$HEADER" "$DOC" >&3
+        COUNT_A=$(( COUNT_A + 1 ))
+
+        # index-b: each document has a MISS_RATE % probability of being skipped.
+        # (RANDOM % 100) yields values 0–99 uniformly; values below MISS_RATE trigger a skip.
+        if (( RANDOM % 100 >= MISS_RATE )); then
+            printf '%s\n%s\n' "$HEADER" "$DOC" >&4
+            COUNT_B=$(( COUNT_B + 1 ))
+        else
+            COUNT_SKIP=$(( COUNT_SKIP + 1 ))
+        fi
+
+        # Refresh progress display every BULK_BATCH_SIZE docs
+        if (( i % BULK_BATCH_SIZE == 0 )); then
+            _GEN_MS=$(( ${EPOCHREALTIME/[.,]/} / 1000 - GEN_START ))
+            _show_d "$(progress_bar $i $NUM_DOCS) - ⏳ $(format_ms $_GEN_MS)"
+        fi
+    done
+
     exec 3>&-
-fi
-if (( BATCH_B > 0 )); then
-    WRITE_START=$(now_ms); exec 4>&-
-    WRITE_TIME=$(( $(now_ms) - WRITE_START ))
-    INDEX_START=$(now_ms)
-    flush_bulk "$BULK_B"
-    INDEX_TIME=$(( $(now_ms) - INDEX_START ))
-    _show_b "$(progress_bar $(( COUNT_B + COUNT_SKIP )) $NUM_DOCS) - ⏳ $(format_ms $INDEX_TIME)"
-    TOTAL_WRITE_B=$(( TOTAL_WRITE_B + WRITE_TIME ))
-    TOTAL_INDEX_B=$(( TOTAL_INDEX_B + INDEX_TIME ))
-    BATCH_COUNT_B=$(( BATCH_COUNT_B + 1 ))
-else
     exec 4>&-
+
+    GEN_MS=$(( ${EPOCHREALTIME/[.,]/} / 1000 - GEN_START ))
+    _show_d "$(progress_bar $NUM_DOCS $NUM_DOCS) - ✓ generated in $(format_ms $GEN_MS)"
 fi
 
-rm -rf "$TMPDIR_BULK"
+# ── 3. Delete existing indices ─────────────────────────────────────────────────
+log "Deleting existing indices..."
+delete_index "$INDEX_A"
+delete_index "$INDEX_B"
+
+# ── 4. Index from cache files ──────────────────────────────────────────────────
+# escli utils load handles batching internally (--size docs per bulk request).
+# Note: this requires the native binary since it takes a file path argument.
+# When the Docker image gains stdin support, this could become:
+#   ./escli utils load --index ${INDEX_A} --size "$BULK_BATCH_SIZE" < "$BULK_A_CACHE"
+
+# Parse "Batch N: X indexed, Y errors" lines from escli utils load and update
+# the progress display after each batch. Process substitution (< <(...)) keeps
+# the while loop in the current shell so _show_* variables remain accessible.
+# stderr is merged into stdout (2>&1) because escli writes batch lines to stderr.
+_load_with_progress() {
+    local total="$1" show_fn="$2"; shift 2
+    local batch_num=0 docs_done=0 elapsed=0 errors=0 last_t now
+    last_t=$(now_ms)
+
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^Batch\ ([0-9]+):\ ([0-9]+)\ indexed,\ ([0-9]+)\ errors ]]; then
+            batch_num="${BASH_REMATCH[1]}"
+            errors="${BASH_REMATCH[3]}"
+            (( errors > 0 )) && die "Batch ${batch_num}: ${errors} bulk error(s)"
+            now=$(now_ms)
+            elapsed=$(( now - last_t )); last_t=$now
+            docs_done=$(( batch_num * BULK_BATCH_SIZE ))
+            (( docs_done > total )) && docs_done=$total
+            "$show_fn" "$(progress_bar $docs_done $total) - ⏳ $(format_ms $elapsed)"
+        fi
+    done < <("$@" 2>&1)
+}
+
+# ── index-a ────────────────────────────────────────────────────────────────────
+log "Indexing ${COUNT_A} documents into ${INDEX_A}..."
+T_A=$(now_ms)
+_load_with_progress "$COUNT_A" _show_a \
+    "${ESCLI_BIN}" utils load --index "$INDEX_A" --size "$BULK_BATCH_SIZE" "$BULK_A_CACHE"
+TOTAL_INDEX_A=$(( $(now_ms) - T_A ))
+_show_a "✅ ${COUNT_A} docs in $(format_ms $TOTAL_INDEX_A)"
+
+# ── index-b ────────────────────────────────────────────────────────────────────
+log "Indexing ${COUNT_B} documents into ${INDEX_B}..."
+T_B=$(now_ms)
+_load_with_progress "$COUNT_B" _show_b \
+    "${ESCLI_BIN}" utils load --index "$INDEX_B" --size "$BULK_BATCH_SIZE" "$BULK_B_CACHE"
+TOTAL_INDEX_B=$(( $(now_ms) - T_B ))
+_show_b "✅ ${COUNT_B} docs in $(format_ms $TOTAL_INDEX_B)"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 (( IS_TTY && _PROG_INIT )) && printf "\033[3A\r\033[J" || echo ""
@@ -277,25 +247,8 @@ if (( NUM_DOCS > 0 )); then
     printf "  %-36s ~%d%%\n" "Effective miss rate:" "$PCT"
 fi
 
-if (( BATCH_COUNT_BUILD > 0 )); then
-    printf "  %-36s build: total %s, avg %s/batch\n" \
-        "generate docs (${BATCH_COUNT_BUILD} batches):" \
-        "$(format_ms $TOTAL_BUILD)" "$(format_ms $(( TOTAL_BUILD / BATCH_COUNT_BUILD )))"
-fi
-if (( BATCH_COUNT_A > 0 )); then
-    printf "  %-36s write: total %s, avg %s/batch\n" \
-        "${INDEX_A} (${BATCH_COUNT_A} batches):" \
-        "$(format_ms $TOTAL_WRITE_A)" "$(format_ms $(( TOTAL_WRITE_A / BATCH_COUNT_A )))"
-    printf "  %-36s index: total %s, avg %s/batch\n" "" \
-        "$(format_ms $TOTAL_INDEX_A)" "$(format_ms $(( TOTAL_INDEX_A / BATCH_COUNT_A )))"
-fi
-if (( BATCH_COUNT_B > 0 )); then
-    printf "  %-36s write: total %s, avg %s/batch\n" \
-        "${INDEX_B} (${BATCH_COUNT_B} batches):" \
-        "$(format_ms $TOTAL_WRITE_B)" "$(format_ms $(( TOTAL_WRITE_B / BATCH_COUNT_B )))"
-    printf "  %-36s index: total %s, avg %s/batch\n" "" \
-        "$(format_ms $TOTAL_INDEX_B)" "$(format_ms $(( TOTAL_INDEX_B / BATCH_COUNT_B )))"
-fi
+printf "  %-36s %s\n" "Indexed ${INDEX_A} in:"             "$(format_ms $TOTAL_INDEX_A)"
+printf "  %-36s %s\n" "Indexed ${INDEX_B} in:"             "$(format_ms $TOTAL_INDEX_B)"
 printf "  %-36s %s\n" "Duration:" "$(format_duration $SECONDS)"
 
 # ── Snapshot: copy target index so it can be restored cheaply ─────────────────
