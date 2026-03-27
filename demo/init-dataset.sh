@@ -110,26 +110,35 @@ BATCH_B=0         # docs buffered in current index-b batch
 # Per-batch timing (milliseconds)
 BATCH_START_A=$(now_ms)
 BATCH_START_B=$(now_ms)
-TOTAL_BUILD_A=0; TOTAL_INDEX_A=0; BATCH_COUNT_A=0
-TOTAL_BUILD_B=0; TOTAL_INDEX_B=0; BATCH_COUNT_B=0
+TOTAL_BUILD=0;   BATCH_COUNT_BUILD=0
+TOTAL_WRITE_A=0; TOTAL_INDEX_A=0; BATCH_COUNT_A=0
+TOTAL_WRITE_B=0; TOTAL_INDEX_B=0; BATCH_COUNT_B=0
 
-# In-place two-line progress (TTY only).
-# _PROG_A / _PROG_B hold the current status string for each index.
-# _prog_draw prints both lines; on subsequent calls it moves the cursor up and rewrites.
+# In-place three-line progress (TTY only).
+# _PROG_D / _PROG_A / _PROG_B hold the current status string for each line.
+# _prog_draw prints all three lines; on subsequent calls it moves the cursor up and rewrites.
 _PROG_INIT=0
-_PROG_A="building first batch..."
-_PROG_B="building first batch..."
+_PROG_D="building first batch..."
+_PROG_A="waiting..."
+_PROG_B="waiting..."
 
 _prog_draw() {
     if (( _PROG_INIT == 0 )); then
+        printf "  → %-12s %s\n" "dataset:" "$_PROG_D"
         printf "  → %-12s %s\n" "${INDEX_A}:" "$_PROG_A"
         printf "  → %-12s %s\n" "${INDEX_B}:" "$_PROG_B"
         _PROG_INIT=1
     else
-        printf "\033[2A\r"
+        printf "\033[3A\r"
+        printf "\033[2K  → %-12s %s\n" "dataset:" "$_PROG_D"
         printf "\033[2K  → %-12s %s\n" "${INDEX_A}:" "$_PROG_A"
         printf "\033[2K  → %-12s %s\n" "${INDEX_B}:" "$_PROG_B"
     fi
+}
+
+_show_d() {
+    if (( IS_TTY )); then _PROG_D="$1"; _prog_draw
+    else info "dataset: $1"; fi
 }
 
 _show_a() {
@@ -190,13 +199,17 @@ for (( i=1; i<=NUM_DOCS; i++ )); do
     # The FD must be closed before flushing (so the OS flushes its buffer to disk)
     # and reopened afterwards for the next batch.
     if (( BATCH_A >= BULK_BATCH_SIZE )); then
-        exec 3>&-
         BUILD_TIME=$(( $(now_ms) - BATCH_START_A ))
+        WRITE_START=$(now_ms); exec 3>&-
+        WRITE_TIME=$(( $(now_ms) - WRITE_START ))
         INDEX_START=$(now_ms)
         flush_bulk "$BULK_A"
         INDEX_TIME=$(( $(now_ms) - INDEX_START ))
-        _show_a "$(progress_bar $COUNT_A $NUM_DOCS) - ⏳ $(format_ms $BUILD_TIME) build, $(format_ms $INDEX_TIME) index"
-        TOTAL_BUILD_A=$(( TOTAL_BUILD_A + BUILD_TIME ))
+        _show_d "$(progress_bar $COUNT_A $NUM_DOCS) - ⏳ $(format_ms $BUILD_TIME)"
+        _show_a "$(progress_bar $COUNT_A $NUM_DOCS) - ⏳ $(format_ms $WRITE_TIME) write, $(format_ms $INDEX_TIME) index"
+        TOTAL_BUILD=$(( TOTAL_BUILD + BUILD_TIME ))
+        BATCH_COUNT_BUILD=$(( BATCH_COUNT_BUILD + 1 ))
+        TOTAL_WRITE_A=$(( TOTAL_WRITE_A + WRITE_TIME ))
         TOTAL_INDEX_A=$(( TOTAL_INDEX_A + INDEX_TIME ))
         BATCH_COUNT_A=$(( BATCH_COUNT_A + 1 ))
         exec 3>"$BULK_A"
@@ -204,13 +217,13 @@ for (( i=1; i<=NUM_DOCS; i++ )); do
         BATCH_START_A=$(now_ms)
     fi
     if (( BATCH_B >= BULK_BATCH_SIZE )); then
-        exec 4>&-
-        BUILD_TIME=$(( $(now_ms) - BATCH_START_B ))
+        WRITE_START=$(now_ms); exec 4>&-
+        WRITE_TIME=$(( $(now_ms) - WRITE_START ))
         INDEX_START=$(now_ms)
         flush_bulk "$BULK_B"
         INDEX_TIME=$(( $(now_ms) - INDEX_START ))
-        _show_b "$(progress_bar $(( COUNT_B + COUNT_SKIP )) $NUM_DOCS) - ⏳ $(format_ms $BUILD_TIME) build, $(format_ms $INDEX_TIME) index"
-        TOTAL_BUILD_B=$(( TOTAL_BUILD_B + BUILD_TIME ))
+        _show_b "$(progress_bar $(( COUNT_B + COUNT_SKIP )) $NUM_DOCS) - ⏳ $(format_ms $WRITE_TIME) write, $(format_ms $INDEX_TIME) index"
+        TOTAL_WRITE_B=$(( TOTAL_WRITE_B + WRITE_TIME ))
         TOTAL_INDEX_B=$(( TOTAL_INDEX_B + INDEX_TIME ))
         BATCH_COUNT_B=$(( BATCH_COUNT_B + 1 ))
         exec 4>"$BULK_B"
@@ -219,36 +232,43 @@ for (( i=1; i<=NUM_DOCS; i++ )); do
     fi
 done
 
-# Close file descriptors before flushing the final batches
-exec 3>&-
-exec 4>&-
-
-# Flush any remaining documents in the buffers
+# Flush any remaining documents in the buffers.
+# The exec close is done here (not before) so we can measure the write time properly.
 if (( BATCH_A > 0 )); then
     BUILD_TIME=$(( $(now_ms) - BATCH_START_A ))
+    WRITE_START=$(now_ms); exec 3>&-
+    WRITE_TIME=$(( $(now_ms) - WRITE_START ))
     INDEX_START=$(now_ms)
     flush_bulk "$BULK_A"
     INDEX_TIME=$(( $(now_ms) - INDEX_START ))
-    _show_a "$(progress_bar $COUNT_A $NUM_DOCS) - ⏳ $(format_ms $BUILD_TIME) build, $(format_ms $INDEX_TIME) index"
-    TOTAL_BUILD_A=$(( TOTAL_BUILD_A + BUILD_TIME ))
+    _show_d "$(progress_bar $COUNT_A $NUM_DOCS) - ⏳ $(format_ms $BUILD_TIME)"
+    _show_a "$(progress_bar $COUNT_A $NUM_DOCS) - ⏳ $(format_ms $WRITE_TIME) write, $(format_ms $INDEX_TIME) index"
+    TOTAL_BUILD=$(( TOTAL_BUILD + BUILD_TIME ))
+    BATCH_COUNT_BUILD=$(( BATCH_COUNT_BUILD + 1 ))
+    TOTAL_WRITE_A=$(( TOTAL_WRITE_A + WRITE_TIME ))
     TOTAL_INDEX_A=$(( TOTAL_INDEX_A + INDEX_TIME ))
     BATCH_COUNT_A=$(( BATCH_COUNT_A + 1 ))
+else
+    exec 3>&-
 fi
 if (( BATCH_B > 0 )); then
-    BUILD_TIME=$(( $(now_ms) - BATCH_START_B ))
+    WRITE_START=$(now_ms); exec 4>&-
+    WRITE_TIME=$(( $(now_ms) - WRITE_START ))
     INDEX_START=$(now_ms)
     flush_bulk "$BULK_B"
     INDEX_TIME=$(( $(now_ms) - INDEX_START ))
-    _show_b "$(progress_bar $(( COUNT_B + COUNT_SKIP )) $NUM_DOCS) - ⏳ $(format_ms $BUILD_TIME) build, $(format_ms $INDEX_TIME) index"
-    TOTAL_BUILD_B=$(( TOTAL_BUILD_B + BUILD_TIME ))
+    _show_b "$(progress_bar $(( COUNT_B + COUNT_SKIP )) $NUM_DOCS) - ⏳ $(format_ms $WRITE_TIME) write, $(format_ms $INDEX_TIME) index"
+    TOTAL_WRITE_B=$(( TOTAL_WRITE_B + WRITE_TIME ))
     TOTAL_INDEX_B=$(( TOTAL_INDEX_B + INDEX_TIME ))
     BATCH_COUNT_B=$(( BATCH_COUNT_B + 1 ))
+else
+    exec 4>&-
 fi
 
 rm -rf "$TMPDIR_BULK"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
-(( IS_TTY && _PROG_INIT )) && printf "\033[2A\r\033[J" || echo ""
+(( IS_TTY && _PROG_INIT )) && printf "\033[3A\r\033[J" || echo ""
 log "Indexing complete."
 printf "  %-36s %d\n"   "Documents generated:"             "$NUM_DOCS"
 printf "  %-36s %d\n"   "Indexed into ${INDEX_A}:"         "$COUNT_A"
@@ -260,25 +280,24 @@ if (( NUM_DOCS > 0 )); then
     printf "  %-36s ~%d%%\n" "Effective miss rate:" "$PCT"
 fi
 
-if (( BATCH_COUNT_A > 0 )); then
+if (( BATCH_COUNT_BUILD > 0 )); then
     printf "  %-36s build: total %s, avg %s/batch\n" \
+        "generate docs (${BATCH_COUNT_BUILD} batches):" \
+        "$(format_ms $TOTAL_BUILD)" "$(format_ms $(( TOTAL_BUILD / BATCH_COUNT_BUILD )))"
+fi
+if (( BATCH_COUNT_A > 0 )); then
+    printf "  %-36s write: total %s, avg %s/batch\n" \
         "${INDEX_A} (${BATCH_COUNT_A} batches):" \
-        "$(format_ms $TOTAL_BUILD_A)" \
-        "$(format_ms $(( TOTAL_BUILD_A / BATCH_COUNT_A )))"
-    printf "  %-36s index: total %s, avg %s/batch\n" \
-        "" \
-        "$(format_ms $TOTAL_INDEX_A)" \
-        "$(format_ms $(( TOTAL_INDEX_A / BATCH_COUNT_A )))"
+        "$(format_ms $TOTAL_WRITE_A)" "$(format_ms $(( TOTAL_WRITE_A / BATCH_COUNT_A )))"
+    printf "  %-36s index: total %s, avg %s/batch\n" "" \
+        "$(format_ms $TOTAL_INDEX_A)" "$(format_ms $(( TOTAL_INDEX_A / BATCH_COUNT_A )))"
 fi
 if (( BATCH_COUNT_B > 0 )); then
-    printf "  %-36s build: total %s, avg %s/batch\n" \
+    printf "  %-36s write: total %s, avg %s/batch\n" \
         "${INDEX_B} (${BATCH_COUNT_B} batches):" \
-        "$(format_ms $TOTAL_BUILD_B)" \
-        "$(format_ms $(( TOTAL_BUILD_B / BATCH_COUNT_B )))"
-    printf "  %-36s index: total %s, avg %s/batch\n" \
-        "" \
-        "$(format_ms $TOTAL_INDEX_B)" \
-        "$(format_ms $(( TOTAL_INDEX_B / BATCH_COUNT_B )))"
+        "$(format_ms $TOTAL_WRITE_B)" "$(format_ms $(( TOTAL_WRITE_B / BATCH_COUNT_B )))"
+    printf "  %-36s index: total %s, avg %s/batch\n" "" \
+        "$(format_ms $TOTAL_INDEX_B)" "$(format_ms $(( TOTAL_INDEX_B / BATCH_COUNT_B )))"
 fi
 printf "  %-36s %s\n" "Duration:" "$(format_duration $SECONDS)"
 
