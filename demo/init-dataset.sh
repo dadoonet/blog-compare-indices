@@ -19,55 +19,8 @@
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
-log()  { echo -e "${GREEN}[init]${NC} $*"; }
-info() { echo -e "${BLUE}  →${NC} $*"; }
-warn() { echo -e "${YELLOW}[init]${NC} $*"; }
-die()  { echo -e "${RED}[init] ERROR:${NC} $*" >&2; exit 1; }
-
-format_duration() {
-    local s=$1
-    local h=$(( s / 3600 )) m=$(( (s % 3600) / 60 )) sec=$(( s % 60 ))
-    (( h > 0 ))  && printf "%dh %02dm %02ds" $h $m $sec && return
-    (( m > 0 ))  && printf "%dm %02ds" $m $sec          && return
-    printf "%ds" $sec
-}
-
-# Returns current time in milliseconds (bash 5+ via EPOCHREALTIME, else perl fallback)
-now_ms() {
-    if (( BASH_VERSINFO[0] >= 5 )); then
-        local t="${EPOCHREALTIME/[.,]/}"
-        echo "$(( t / 1000 ))"
-    else
-        perl -MTime::HiRes=time -e 'printf "%d\n", time()*1000'
-    fi
-}
-
-# Formats a millisecond duration as a human-readable string
-format_ms() {
-    local ms=$1
-    if (( ms < 1000 )); then
-        printf "%dms" "$ms"
-    elif (( ms < 60000 )); then
-        printf "%d.%03ds" "$(( ms / 1000 ))" "$(( ms % 1000 ))"
-    else
-        local s=$(( ms / 1000 ))
-        printf "%dm %02d.%03ds" "$(( s / 60 ))" "$(( s % 60 ))" "$(( ms % 1000 ))"
-    fi
-}
-
-progress_bar() {
-    local current=$1 total=$2 width=25
-    local pct=$(( current * 100 / total ))
-    local filled=$(( current * width / total ))
-    local empty=$(( width - filled ))
-    local bar="" i
-    for (( i=0; i<filled; i++ )); do bar+="█"; done
-    for (( i=0; i<empty;  i++ )); do bar+="░"; done
-    printf "[%s] %3d%%" "$bar" "$pct"
-}
-
-IS_TTY=0; [ -t 1 ] && IS_TTY=1
+source "${SCRIPT_DIR}/lib/log.sh"   "init"
+source "${SCRIPT_DIR}/lib/utils.sh"
 
 SECONDS=0   # bash built-in: counts elapsed seconds automatically
 

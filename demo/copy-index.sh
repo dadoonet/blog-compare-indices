@@ -15,18 +15,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ESCLI="${SCRIPT_DIR}/escli"
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
-log()  { echo -e "${GREEN}[copy-index]${NC} $*"; }
-info() { echo -e "${BLUE}  →${NC} $*"; }
-die()  { echo -e "${RED}[copy-index] ERROR:${NC} $*" >&2; exit 1; }
-
-format_duration() {
-    local s=$1
-    local h=$(( s / 3600 )) m=$(( (s % 3600) / 60 )) sec=$(( s % 60 ))
-    (( h > 0 ))  && printf "%dh %02dm %02ds" $h $m $sec && return
-    (( m > 0 ))  && printf "%dm %02ds" $m $sec          && return
-    printf "%ds" $sec
-}
+source "${SCRIPT_DIR}/lib/log.sh"   "copy-index"
+source "${SCRIPT_DIR}/lib/utils.sh"
 
 SECONDS=0
 

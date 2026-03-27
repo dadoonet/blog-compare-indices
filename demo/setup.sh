@@ -16,12 +16,7 @@
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# ── Colours ───────────────────────────────────────────────────────────────────
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
-log()  { echo -e "${GREEN}[setup]${NC} $*"; }
-info() { echo -e "${BLUE}  →${NC} $*"; }
-warn() { echo -e "${YELLOW}[setup]${NC} $*"; }
-die()  { echo -e "${RED}[setup] ERROR:${NC} $*" >&2; exit 1; }
+source "${SCRIPT_DIR}/lib/log.sh" "setup"
 
 # Portable in-place sed: macOS requires an explicit (empty) backup extension
 _sed_i() { [[ "$OSTYPE" == darwin* ]] && sed -i '' "$@" || sed -i "$@"; }
