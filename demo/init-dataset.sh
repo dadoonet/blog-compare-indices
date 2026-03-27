@@ -33,6 +33,29 @@ format_duration() {
     printf "%ds" $sec
 }
 
+# Returns current time in milliseconds (bash 5+ via EPOCHREALTIME, else perl fallback)
+now_ms() {
+    if (( BASH_VERSINFO[0] >= 5 )); then
+        local t="${EPOCHREALTIME/[.,]/}"
+        echo "$(( t / 1000 ))"
+    else
+        perl -MTime::HiRes=time -e 'printf "%d\n", time()*1000'
+    fi
+}
+
+# Formats a millisecond duration as a human-readable string
+format_ms() {
+    local ms=$1
+    if (( ms < 1000 )); then
+        printf "%dms" "$ms"
+    elif (( ms < 60000 )); then
+        printf "%d.%03ds" "$(( ms / 1000 ))" "$(( ms % 1000 ))"
+    else
+        local s=$(( ms / 1000 ))
+        printf "%dm %02d.%03ds" "$(( s / 60 ))" "$(( s % 60 ))" "$(( ms % 1000 ))"
+    fi
+}
+
 SECONDS=0   # bash built-in: counts elapsed seconds automatically
 
 ESCLI_BIN="${SCRIPT_DIR}/escli"
@@ -118,9 +141,9 @@ COUNT_SKIP=0      # docs omitted from index-b
 BATCH_A=0         # docs buffered in current index-a batch
 BATCH_B=0         # docs buffered in current index-b batch
 
-# Per-batch timing (seconds)
-BATCH_START_A=$SECONDS
-BATCH_START_B=$SECONDS
+# Per-batch timing (milliseconds)
+BATCH_START_A=$(now_ms)
+BATCH_START_B=$(now_ms)
 TOTAL_BUILD_A=0; TOTAL_INDEX_A=0; BATCH_COUNT_A=0
 TOTAL_BUILD_B=0; TOTAL_INDEX_B=0; BATCH_COUNT_B=0
 
@@ -171,31 +194,33 @@ for (( i=1; i<=NUM_DOCS; i++ )); do
     # and reopened afterwards for the next batch.
     if (( BATCH_A >= BULK_BATCH_SIZE )); then
         exec 3>&-
-        BUILD_TIME=$(( SECONDS - BATCH_START_A ))
-        INDEX_START=$SECONDS
+        BUILD_TIME=$(( $(now_ms) - BATCH_START_A ))
+        INDEX_START=$(now_ms)
         flush_bulk "$BULK_A"
-        INDEX_TIME=$(( SECONDS - INDEX_START ))
-        info "Indexing batch into ${INDEX_A} (${COUNT_A} docs so far) - ⏳ ${BUILD_TIME}s to build, ${INDEX_TIME}s to index"
+        INDEX_TIME=$(( $(now_ms) - INDEX_START ))
+        PCT=$(( COUNT_A * 100 / NUM_DOCS ))
+        info "Indexing batch into ${INDEX_A} (${COUNT_A}/${NUM_DOCS}, ${PCT}%) - ⏳ $(format_ms $BUILD_TIME) to build, $(format_ms $INDEX_TIME) to index"
         TOTAL_BUILD_A=$(( TOTAL_BUILD_A + BUILD_TIME ))
         TOTAL_INDEX_A=$(( TOTAL_INDEX_A + INDEX_TIME ))
         BATCH_COUNT_A=$(( BATCH_COUNT_A + 1 ))
         exec 3>"$BULK_A"
         BATCH_A=0
-        BATCH_START_A=$SECONDS
+        BATCH_START_A=$(now_ms)
     fi
     if (( BATCH_B >= BULK_BATCH_SIZE )); then
         exec 4>&-
-        BUILD_TIME=$(( SECONDS - BATCH_START_B ))
-        INDEX_START=$SECONDS
+        BUILD_TIME=$(( $(now_ms) - BATCH_START_B ))
+        INDEX_START=$(now_ms)
         flush_bulk "$BULK_B"
-        INDEX_TIME=$(( SECONDS - INDEX_START ))
-        info "Indexing batch into ${INDEX_B} (${COUNT_B} docs so far) - ⏳ ${BUILD_TIME}s to build, ${INDEX_TIME}s to index"
+        INDEX_TIME=$(( $(now_ms) - INDEX_START ))
+        PCT=$(( (COUNT_B + COUNT_SKIP) * 100 / NUM_DOCS ))
+        info "Indexing batch into ${INDEX_B} (${COUNT_B}/${NUM_DOCS}, ${PCT}%) - ⏳ $(format_ms $BUILD_TIME) to build, $(format_ms $INDEX_TIME) to index"
         TOTAL_BUILD_B=$(( TOTAL_BUILD_B + BUILD_TIME ))
         TOTAL_INDEX_B=$(( TOTAL_INDEX_B + INDEX_TIME ))
         BATCH_COUNT_B=$(( BATCH_COUNT_B + 1 ))
         exec 4>"$BULK_B"
         BATCH_B=0
-        BATCH_START_B=$SECONDS
+        BATCH_START_B=$(now_ms)
     fi
 done
 
@@ -205,21 +230,21 @@ exec 4>&-
 
 # Flush any remaining documents in the buffers
 if (( BATCH_A > 0 )); then
-    BUILD_TIME=$(( SECONDS - BATCH_START_A ))
-    INDEX_START=$SECONDS
+    BUILD_TIME=$(( $(now_ms) - BATCH_START_A ))
+    INDEX_START=$(now_ms)
     flush_bulk "$BULK_A"
-    INDEX_TIME=$(( SECONDS - INDEX_START ))
-    info "Indexing final batch into ${INDEX_A} (${COUNT_A} docs so far) - ⏳ ${BUILD_TIME}s to build, ${INDEX_TIME}s to index"
+    INDEX_TIME=$(( $(now_ms) - INDEX_START ))
+    info "Indexing final batch into ${INDEX_A} (${COUNT_A}/${NUM_DOCS}, 100%) - ⏳ $(format_ms $BUILD_TIME) to build, $(format_ms $INDEX_TIME) to index"
     TOTAL_BUILD_A=$(( TOTAL_BUILD_A + BUILD_TIME ))
     TOTAL_INDEX_A=$(( TOTAL_INDEX_A + INDEX_TIME ))
     BATCH_COUNT_A=$(( BATCH_COUNT_A + 1 ))
 fi
 if (( BATCH_B > 0 )); then
-    BUILD_TIME=$(( SECONDS - BATCH_START_B ))
-    INDEX_START=$SECONDS
+    BUILD_TIME=$(( $(now_ms) - BATCH_START_B ))
+    INDEX_START=$(now_ms)
     flush_bulk "$BULK_B"
-    INDEX_TIME=$(( SECONDS - INDEX_START ))
-    info "Indexing final batch into ${INDEX_B} (${COUNT_B} docs so far) - ⏳ ${BUILD_TIME}s to build, ${INDEX_TIME}s to index"
+    INDEX_TIME=$(( $(now_ms) - INDEX_START ))
+    info "Indexing final batch into ${INDEX_B} (${COUNT_B}/${NUM_DOCS}, 100%) - ⏳ $(format_ms $BUILD_TIME) to build, $(format_ms $INDEX_TIME) to index"
     TOTAL_BUILD_B=$(( TOTAL_BUILD_B + BUILD_TIME ))
     TOTAL_INDEX_B=$(( TOTAL_INDEX_B + INDEX_TIME ))
     BATCH_COUNT_B=$(( BATCH_COUNT_B + 1 ))
@@ -241,16 +266,24 @@ if (( NUM_DOCS > 0 )); then
 fi
 
 if (( BATCH_COUNT_A > 0 )); then
-    printf "  %-36s avg %ds build, %ds index\n" \
-        "${INDEX_A} batch stats (${BATCH_COUNT_A} batches):" \
-        "$(( TOTAL_BUILD_A / BATCH_COUNT_A ))" \
-        "$(( TOTAL_INDEX_A / BATCH_COUNT_A ))"
+    printf "  %-36s build: total %s, avg %s/batch\n" \
+        "${INDEX_A} (${BATCH_COUNT_A} batches):" \
+        "$(format_ms $TOTAL_BUILD_A)" \
+        "$(format_ms $(( TOTAL_BUILD_A / BATCH_COUNT_A )))"
+    printf "  %-36s index: total %s, avg %s/batch\n" \
+        "" \
+        "$(format_ms $TOTAL_INDEX_A)" \
+        "$(format_ms $(( TOTAL_INDEX_A / BATCH_COUNT_A )))"
 fi
 if (( BATCH_COUNT_B > 0 )); then
-    printf "  %-36s avg %ds build, %ds index\n" \
-        "${INDEX_B} batch stats (${BATCH_COUNT_B} batches):" \
-        "$(( TOTAL_BUILD_B / BATCH_COUNT_B ))" \
-        "$(( TOTAL_INDEX_B / BATCH_COUNT_B ))"
+    printf "  %-36s build: total %s, avg %s/batch\n" \
+        "${INDEX_B} (${BATCH_COUNT_B} batches):" \
+        "$(format_ms $TOTAL_BUILD_B)" \
+        "$(format_ms $(( TOTAL_BUILD_B / BATCH_COUNT_B )))"
+    printf "  %-36s index: total %s, avg %s/batch\n" \
+        "" \
+        "$(format_ms $TOTAL_INDEX_B)" \
+        "$(format_ms $(( TOTAL_INDEX_B / BATCH_COUNT_B )))"
 fi
 printf "  %-36s %s\n" "Duration:" "$(format_duration $SECONDS)"
 

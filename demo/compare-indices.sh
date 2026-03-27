@@ -39,6 +39,27 @@ format_duration() {
     printf "%ds" $sec
 }
 
+now_ms() {
+    if (( BASH_VERSINFO[0] >= 5 )); then
+        local t="${EPOCHREALTIME/[.,]/}"
+        echo "$(( t / 1000 ))"
+    else
+        perl -MTime::HiRes=time -e 'printf "%d\n", time()*1000'
+    fi
+}
+
+format_ms() {
+    local ms=$1
+    if (( ms < 1000 )); then
+        printf "%dms" "$ms"
+    elif (( ms < 60000 )); then
+        printf "%d.%03ds" "$(( ms / 1000 ))" "$(( ms % 1000 ))"
+    else
+        local s=$(( ms / 1000 ))
+        printf "%dm %02d.%03ds" "$(( s / 60 ))" "$(( s % 60 ))" "$(( ms % 1000 ))"
+    fi
+}
+
 SECONDS=0   # bash built-in: counts elapsed seconds automatically
 
 # ── Load defaults from .env.sh, then allow CLI overrides ──────────────────────
@@ -116,6 +137,8 @@ SEARCH_AFTER="null"  # null = first page; updated from each response
 TOTAL_CHECKED=0
 MISSING_COUNT=0
 PAGE=0
+TOTAL_SEARCH_MS=0
+TOTAL_MGET_MS=0
 
 while true; do
     PAGE=$(( PAGE + 1 ))
@@ -140,7 +163,10 @@ while true; do
             "sort": [{"_shard_doc": "asc"}]
         } + (if $search_after != null then {"search_after": $search_after} else {} end)')
 
+    SEARCH_START=$(now_ms)
     SEARCH_RESPONSE=$("$ESCLI" search <<< "$SEARCH_BODY")
+    SEARCH_MS=$(( $(now_ms) - SEARCH_START ))
+    TOTAL_SEARCH_MS=$(( TOTAL_SEARCH_MS + SEARCH_MS ))
 
     # Refresh the PIT ID — Elasticsearch may return an updated one
     NEW_PIT_ID=$(echo "$SEARCH_RESPONSE" | jq -r '.pit_id // empty')
@@ -153,7 +179,6 @@ while true; do
     (( HIT_COUNT == 0 )) && break
 
     TOTAL_CHECKED=$(( TOTAL_CHECKED + HIT_COUNT ))
-    info "Page ${PAGE}: ${HIT_COUNT} IDs fetched (${TOTAL_CHECKED} total checked so far)..."
 
     # Advance the cursor: search_after uses the sort value of the last hit
     SEARCH_AFTER=$(echo "$HITS" | jq -c '.[-1].sort')
@@ -163,7 +188,13 @@ while true; do
     # whether the document exists in the target index, without fetching its content.
     IDS_JSON=$(echo "$HITS" | jq -c '[.[]._id]')
     MGET_BODY=$(jq -n --argjson ids "$IDS_JSON" '{"ids": $ids}')
+    MGET_START=$(now_ms)
     MGET_RESPONSE=$("$ESCLI" mget --index "$INDEX_B" --_source false <<< "$MGET_BODY")
+    MGET_MS=$(( $(now_ms) - MGET_START ))
+    TOTAL_MGET_MS=$(( TOTAL_MGET_MS + MGET_MS ))
+
+    PCT=$(( TOTAL_CHECKED * 100 / COUNT_A ))
+    info "Page ${PAGE} (${TOTAL_CHECKED}/${COUNT_A}, ${PCT}%) - ⏳ search: $(format_ms $SEARCH_MS), mget: $(format_ms $MGET_MS)"
 
     # Extract IDs where found == false
     MISSING_IDS=$(echo "$MGET_RESPONSE" | jq -r '.docs[] | select(.found == false) | ._id')
@@ -184,7 +215,17 @@ printf "  %-38s %d\n" "Documents missing from ${INDEX_B}:"   "$MISSING_COUNT"
 
 if (( MISSING_COUNT > 0 && TOTAL_CHECKED > 0 )); then
     PCT=$(( MISSING_COUNT * 100 / TOTAL_CHECKED ))
-    printf "  %-38s ~%d%%\n" "Missing rate:"                  "$PCT"
+    printf "  %-38s ~%d%%\n" "Missing rate:" "$PCT"
+fi
+if (( PAGE > 0 )); then
+    printf "  %-38s search: total %s, avg %s/page\n" \
+        "Scan stats (${PAGE} pages):" \
+        "$(format_ms $TOTAL_SEARCH_MS)" \
+        "$(format_ms $(( TOTAL_SEARCH_MS / PAGE )))"
+    printf "  %-38s mget:   total %s, avg %s/page\n" \
+        "" \
+        "$(format_ms $TOTAL_MGET_MS)" \
+        "$(format_ms $(( TOTAL_MGET_MS / PAGE )))"
 fi
 printf "  %-38s %s\n" "Duration:" "$(format_duration $SECONDS)"
 
