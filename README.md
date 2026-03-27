@@ -97,13 +97,13 @@ if the document count matches — only the indexing step is repeated, not the ge
 
 Default parameters (override in `demo/.env.demo` or via CLI flags):
 
-| Parameter         | Default     | Description                               |
-|-------------------|-------------|-------------------------------------------|
-| `NUM_DOCS`        | `1000000`   | Documents generated in `index-a`          |
-| `MISS_RATE`       | `5`         | % of docs randomly omitted from `index-b` |
-| `BULK_BATCH_SIZE` | `10000`     | Documents per bulk API call               |
-| `INDEX_A`         | `index-a`   | Source index name                         |
-| `INDEX_B`         | `index-b`   | Target index name                         |
+| Parameter         | Default   | Description                                |
+|-------------------|-----------|--------------------------------------------|
+| `NUM_DOCS`        | `1000000` | Documents generated in `index-a`           |
+| `MISS_RATE`       | `5`       | % of docs randomly omitted from `index-b`  |
+| `BULK_BATCH_SIZE` | `10000`   | Documents per bulk API call                |
+| `INDEX_A`         | `index-a` | Source index name                          |
+| `INDEX_B`         | `index-b` | Target index name                          |
 
 Example with custom values:
 
@@ -137,14 +137,14 @@ Override defaults via CLI:
 ./compare-indices.sh --batch-size 500 --output my-missing.txt
 ```
 
-| Parameter          | Default           | Description                                              |
-|--------------------|-------------------|----------------------------------------------------------|
-| `--source`         | `index-a`         | Source index to scan                                     |
-| `--target`         | `index-b`         | Target index to check against                            |
-| `--batch-size`     | `10000`           | IDs per search page / `_mget` call                       |
-| `--pit-keep-alive` | `5m`              | PIT keep-alive duration                                  |
-| `--output`         | `missing-ids.txt` | Output file for missing IDs                              |
-| `--strategy`       | `querydsl`        | Comparison strategy (`querydsl`, `esql` — coming soon)   |
+| Parameter          | Default           | Description                                            |
+|--------------------|-------------------|--------------------------------------------------------|
+| `--source`         | `index-a`         | Source index to scan                                   |
+| `--target`         | `index-b`         | Target index to check against                          |
+| `--batch-size`     | `10000`           | IDs per search page / `_mget` call                     |
+| `--pit-keep-alive` | `5m`              | PIT keep-alive duration                                |
+| `--output`         | `missing-ids.txt` | Output file for missing IDs                            |
+| `--strategy`       | `querydsl`        | Comparison strategy (`querydsl`, `esql` — coming soon) |
 
 ### 5. Re-index missing documents
 
@@ -159,21 +159,22 @@ The default strategy (`reindex`) delegates everything to the `_reindex` API with
 query — no document data crosses the network. Use `--strategy mgetbulk` to fetch documents
 via `_mget` and write them via `_bulk` instead.
 
-| Parameter      | Default           | Description                                  |
-|----------------|-------------------|----------------------------------------------|
-| `--source`     | `index-a`         | Source index to fetch documents from         |
-| `--target`     | `index-b`         | Target index to reindex into                 |
-| `--input`      | `missing-ids.txt` | File of IDs produced by `compare-indices.sh` |
-| `--batch-size` | `10000`           | IDs per request                              |
-| `--strategy`   | `reindex`         | `mgetbulk`, `reindex`, or `reindex-all`      |
+| Parameter      | Default           | Description                                                      |
+|----------------|-------------------|------------------------------------------------------------------|
+| `--source`     | `index-a`         | Source index to fetch documents from                             |
+| `--target`     | `index-b`         | Target index to reindex into                                     |
+| `--input`      | `missing-ids.txt` | File of IDs produced by `compare-indices.sh`                     |
+| `--batch-size` | `10000`           | IDs per request                                                  |
+| `--strategy`   | `reindex`         | `mgetbulk`, `reindex`, `reindex-all`, or `esclidump`             |
 
 Strategy details:
 
-| Strategy      | Description                                                                        |
-|---------------|------------------------------------------------------------------------------------|
-| `mgetbulk`    | `_mget` from source + `_bulk` into target (client-side transport)                  |
-| `reindex`     | `_reindex` with `ids` query per batch (server-side, no document data on the wire)  |
-| `reindex-all` | `_reindex` with no filter — full copy, ignores the input file                      |
+| Strategy      | Description                                                                       |
+|---------------|-----------------------------------------------------------------------------------|
+| `mgetbulk`    | `_mget` from source + `_bulk` into target (client-side transport)                 |
+| `reindex`     | `_reindex` with `ids` query per batch (server-side, no document data on the wire) |
+| `reindex-all` | `_reindex` with no filter — full copy, ignores the input file                     |
+| `esclidump`   | `escli utils dump` (ids query) piped into `escli utils load` (binary-to-binary)   |
 
 ### 6. Restore the snapshot and re-test
 
@@ -191,10 +192,10 @@ To restore `index-b` from the snapshot saved by `init-dataset.sh` and run the co
 ./copy-index.sh --source my-index --target my-index-backup
 ```
 
-| Parameter  | Default        | Description                                |
-|------------|----------------|--------------------------------------------|
-| `--source` | `index-target` | Index to copy from                         |
-| `--target` | `index-b`      | Index to copy into (deleted and recreated) |
+| Parameter  | Default        | Description                                 |
+|------------|----------------|---------------------------------------------|
+| `--source` | `index-target` | Index to copy from                          |
+| `--target` | `index-b`      | Index to copy into (deleted and recreated)  |
 
 ## License
 

@@ -11,11 +11,12 @@
 #   --source <name>     Source index                  (default: index-a)
 #   --target <name>     Target index                  (default: index-b)
 #   --input <file>      File with missing IDs         (default: missing-ids.txt)
-#   --batch-size <n>    IDs per _mget / bulk call     (default: 10000)
+#   --batch-size <n>    IDs per request               (default: 10000)
 #   --strategy <name>   Reindex strategy              (default: reindex)
 #                         mgetbulk    _mget from index-a + bulk into index-b
 #                         reindex     _reindex API with ids query, batched from input file (default)
 #                         reindex-all _reindex API with no filter (full copy)
+#                         esclidump   escli utils dump (ids query) piped into escli utils load
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -57,15 +58,15 @@ while [[ $# -gt 0 ]]; do
         --batch-size) BATCH_SIZE="$2";  shift 2 ;;
         --strategy)   STRATEGY="$2";    shift 2 ;;
         -h|--help)
-            grep '^# ' "$0" | head -20 | sed 's/^# \?//'
+            grep '^# ' "$0" | head -21 | sed 's/^# \?//'
             exit 0 ;;
         *) die "Unknown option: $1" ;;
     esac
 done
 
 case "$STRATEGY" in
-    mgetbulk|reindex|reindex-all) ;;
-    *) die "Unknown strategy: ${STRATEGY}. Valid values: mgetbulk, reindex, reindex-all" ;;
+    mgetbulk|reindex|reindex-all|esclidump) ;;
+    *) die "Unknown strategy: ${STRATEGY}. Valid values: mgetbulk, reindex, reindex-all, esclidump" ;;
 esac
 
 command -v jq >/dev/null || die "jq is required (brew install jq / apt install jq)"
@@ -194,6 +195,43 @@ process_batch_reindex() {
     BATCH_DETAIL="⏳ reindex: $(format_ms $reindex_ms)"
 }
 
+# ── Process a batch of IDs — esclidump strategy ───────────────────────────────
+# Dumps matching documents from index-a via `escli utils dump` (filtered by an
+# ids query) and pipes the bulk NDJSON directly into `escli utils load`.
+# No document data passes through jq or the client — the raw source goes
+# straight from dump stdout to load stdin.
+process_batch_esclidump() {
+    local -a ids=("$@")
+
+    # Write the ids query to a temp file — escli utils dump --query requires a file
+    local query_file
+    query_file=$(mktemp)
+    printf '%s\n' "${ids[@]}" | jq -R . | jq -s '{"ids":{"values":.}}' > "$query_file"
+
+    local dump_start dump_ms indexed=0 errors=0
+    dump_start=$(now_ms)
+
+    # Pipe dump stdout → load stdin.
+    # --skip-index-name: omit _index from action lines (load sets it via --index)
+    # --add-id:          preserve original _id in action lines
+    # dump stderr → /dev/null (progress noise); load stderr → captured (Batch N: lines)
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^Batch\ ([0-9]+):\ ([0-9]+)\ indexed,\ ([0-9]+)\ errors ]]; then
+            errors="${BASH_REMATCH[3]}"
+            (( errors > 0 )) && die "Load errors in batch ${BASH_REMATCH[1]}: ${errors} error(s)"
+            indexed=$(( indexed + BASH_REMATCH[2] ))
+        fi
+    done < <("$ESCLI" utils dump "$INDEX_A" \
+                  --query "$query_file" --skip-index-name --add-id 2>/dev/null \
+              | "$ESCLI" utils load --index "$INDEX_B" 2>&1)
+
+    rm -f "$query_file"
+    dump_ms=$(( $(now_ms) - dump_start ))
+    REINDEXED_TOTAL=$(( REINDEXED_TOTAL + indexed ))
+    TOTAL_DUMP_MS=$(( TOTAL_DUMP_MS + dump_ms ))
+    BATCH_DETAIL="⏳ dump+load: $(format_ms $dump_ms)"
+}
+
 # ── Paginate through the input file in batches ────────────────────────────────
 REINDEXED_TOTAL=0
 NOT_FOUND_TOTAL=0
@@ -203,6 +241,7 @@ IDS_PROCESSED=0
 TOTAL_MGET_MS=0
 TOTAL_BULK_MS=0
 TOTAL_REINDEX_MS=0
+TOTAL_DUMP_MS=0
 BATCH_DETAIL=""
 
 while IFS= read -r doc_id; do
@@ -212,8 +251,9 @@ while IFS= read -r doc_id; do
     if (( ${#BATCH[@]} >= BATCH_SIZE )); then
         BATCH_NUM=$(( BATCH_NUM + 1 ))
         case "$STRATEGY" in
-            mgetbulk) process_batch_mgetbulk "${BATCH[@]}" ;;
-            reindex)  process_batch_reindex  "${BATCH[@]}" ;;
+            mgetbulk)  process_batch_mgetbulk  "${BATCH[@]}" ;;
+            reindex)   process_batch_reindex   "${BATCH[@]}" ;;
+            esclidump) process_batch_esclidump "${BATCH[@]}" ;;
         esac
         IDS_PROCESSED=$(( IDS_PROCESSED + ${#BATCH[@]} ))
         _progress "Batch ${BATCH_NUM} $(progress_bar $IDS_PROCESSED $TOTAL_IDS) - ${BATCH_DETAIL}"
@@ -225,8 +265,9 @@ done < "$INPUT_FILE"
 if (( ${#BATCH[@]} > 0 )); then
     BATCH_NUM=$(( BATCH_NUM + 1 ))
     case "$STRATEGY" in
-        mgetbulk) process_batch_mgetbulk "${BATCH[@]}" ;;
-        reindex)  process_batch_reindex  "${BATCH[@]}" ;;
+        mgetbulk)  process_batch_mgetbulk  "${BATCH[@]}" ;;
+        reindex)   process_batch_reindex   "${BATCH[@]}" ;;
+        esclidump) process_batch_esclidump "${BATCH[@]}" ;;
     esac
     IDS_PROCESSED=$(( IDS_PROCESSED + ${#BATCH[@]} ))
     _progress "Batch ${BATCH_NUM} $(progress_bar $IDS_PROCESSED $TOTAL_IDS) - ${BATCH_DETAIL}"
@@ -257,5 +298,10 @@ elif [[ "$STRATEGY" == "reindex" ]] && (( BATCH_NUM > 0 )); then
         "Batch stats (${BATCH_NUM} batches):" \
         "$(format_ms $TOTAL_REINDEX_MS)" \
         "$(format_ms $(( TOTAL_REINDEX_MS / BATCH_NUM )))"
+elif [[ "$STRATEGY" == "esclidump" ]] && (( BATCH_NUM > 0 )); then
+    printf "  %-38s dump+load: total %s, avg %s/batch\n" \
+        "Batch stats (${BATCH_NUM} batches):" \
+        "$(format_ms $TOTAL_DUMP_MS)" \
+        "$(format_ms $(( TOTAL_DUMP_MS / BATCH_NUM )))"
 fi
 printf "  %-38s %s\n" "Duration:" "$(format_duration $SECONDS)"

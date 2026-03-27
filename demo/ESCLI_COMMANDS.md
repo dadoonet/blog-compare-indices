@@ -137,6 +137,55 @@ Note: when using a PIT, do not pass `--index` — the index is embedded in the P
 
 ---
 
+## Dump documents from an index ✅
+
+```bash
+./escli utils dump <index> [options]
+```
+
+Dumps all documents from one or more indices as bulk-compatible NDJSON (action line + source line per document).
+Uses PIT internally for a consistent read. Output goes to stdout by default.
+
+Options:
+
+| Flag               | Default | Description                                                                  |
+|--------------------|---------|------------------------------------------------------------------------------|
+| `--size <n>`       | `500`   | Documents per batch                                                          |
+| `--keep-alive <t>` | `1m`    | PIT keep-alive duration                                                      |
+| `--output <file>`  | stdout  | Write output to a file instead of stdout                                     |
+| `--skip-index-name`|         | Omit `_index` from action lines (produces `{"index":{}}`)                   |
+| `--add-id`         |         | Include `_id` in action lines                                                |
+| `--query <file>`   |         | Path to a file containing an Elasticsearch query clause to filter documents  |
+
+The `--query` file contains a query clause (not a full search body):
+
+```json
+{ "term": { "status": "active" } }
+```
+
+Use `-` to read the query from stdin:
+
+```bash
+cat query.json | ./escli utils dump my-index --query -
+```
+
+Examples:
+
+```bash
+# Dump all documents, pipe into another index
+./escli utils dump index-a --skip-index-name | ./escli utils load --index index-b
+
+# Dump with _id preserved (for re-indexing to the same index)
+./escli utils dump my-index --add-id | ./escli utils load --index my-index
+
+# Dump only documents matching an ids query
+echo '{"ids":{"values":["id-1","id-2"]}}' > /tmp/query.json
+./escli utils dump index-a --query /tmp/query.json --skip-index-name --add-id \
+  | ./escli utils load --index index-b
+```
+
+---
+
 ## Close Point-in-Time ✅
 
 ```bash
