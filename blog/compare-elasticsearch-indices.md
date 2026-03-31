@@ -1,6 +1,6 @@
 # How to Compare Two Elasticsearch Indices and Find Missing Documents
 
-When managing Elasticsearch indices, you may need to verify that all documents present in one index also exist in another — after a reindex operation, a migration, or a data pipeline. Elasticsearch doesn't provide a built-in "diff" command for this, but you can do it efficiently by combining four APIs: `_count`, `_search` with Point-in-Time, `_mget`, and `_reindex`.
+When managing Elasticsearch indices, you may need to verify that all documents present in one index also exist in another — after a reindex operation, a migration, or a data pipeline. Elasticsearch doesn't provide a built-in "diff" command for this, but the right approach depends on one key question: **are your document IDs stable between the two indices?**
 
 ## The Problem
 
@@ -8,17 +8,12 @@ Imagine you have two indices, `index-a` (source) and `index-b` (target), and you
 
 A naive approach — querying both indices and comparing results in memory — won't scale. Elasticsearch is designed to handle millions of documents, and loading them all at once is not practical.
 
-## The Strategy
+There are two scenarios:
 
-The approach has four steps:
+1. **IDs are stable**: both indices use the same `_id` for the same document (e.g. `emp_no` as the document ID). This is the easy case.
+2. **IDs are generated**: documents were ingested through different pipelines that assigned random or sequential IDs. You can't compare by `_id` — you need to match on content.
 
-1. **Count documents** in both indices. A count mismatch is a fast indicator that something is off.
-2. **Open a Point-in-Time (PIT)** on the source index to get a consistent, stable snapshot.
-3. **Paginate through all document IDs** in the source using `search_after`, fetching only `_id` (no `_source`).
-4. **Batch-check existence** in the target index using `_mget`.
-5. **Reindex missing documents** using `_reindex` with an `ids` query — entirely server-side, no document data crosses the network.
-
-Let's walk through each step.
+Let's walk through both.
 
 ## Step 0 — A Lighter CLI for Elasticsearch
 
@@ -40,7 +35,7 @@ With `escli`, the same request becomes:
 ./escli search --index my-index-000001 <<< '{"query":{"term":{"user.id":"kimchy"}}}'
 ```
 
-The credentials live in a `.env` file that escli sources automatically — no `-H "Authorization: ..."` on every call, no risk of leaking secrets in shell history. The request body is passed via stdin (`<<<`), which also makes it easy to pipe in multi-line JSON built dynamically with `jq`.
+The credentials live in a `.env` file that escli sources automatically — no `-H "Authorization: ..."` on every call, no risk of leaking secrets in shell history. The request body is passed via stdin (`<<<`), which makes it easy to pipe in multi-line JSON built dynamically with `jq`.
 
 ## Step 1 — Count Documents in Both Indices
 
@@ -59,115 +54,126 @@ The `_count` API returns:
 
 If the counts differ, proceed to the full comparison.
 
-## Step 2 — Open a Point-in-Time on the Source Index
+## Step 2 — When IDs Are Stable: Use `op_type=create`
 
-A [Point-in-Time (PIT)](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-open-point-in-time) freezes a consistent view of the index for the duration of the scan. Without it, concurrent writes could cause documents to appear or disappear across pages, making the comparison unreliable.
+If both indices use the same `_id` for the same document — for example, because you indexed documents using a functional business key like `emp_no` rather than a generated UUID — you can find and fix missing documents in a single `_reindex` call.
+
+### Why functional IDs matter
+
+Using a meaningful field as `_id` (instead of a random UUID) is a best practice when the data has a natural key. It means:
+
+- The same document always gets the same `_id`, regardless of which pipeline ingested it.
+- You can use `op_type=create` to skip documents that already exist in the target.
+- No client-side scanning or comparison is needed.
+
+### The `op_type=create` trick
+
+`_reindex` with `op_type=create` tries to create each document from the source in the target. If a document with the same `_id` already exists, Elasticsearch reports it as a `version_conflict` and moves on — it does **not** overwrite the existing document. Setting `conflicts=proceed` tells the API to continue instead of aborting on the first conflict.
+
+```bash
+./escli reindex <<< '{
+  "source": { "index": "index-a" },
+  "dest":   { "index": "index-b", "op_type": "create" },
+  "conflicts": "proceed"
+}'
+```
+
+The response tells you exactly what happened:
+
+```json
+{
+  "total": 1000000,
+  "created": 49594,
+  "version_conflicts": 950406,
+  "failures": []
+}
+```
+
+- `created`: documents that were missing from `index-b` and have now been added.
+- `version_conflicts`: documents that already existed in `index-b` and were left untouched.
+
+**No scanning, no client-side comparison, no intermediate file.** Everything happens server-side in about 6 seconds on a 1M-document dataset.
+
+## Step 3 — When IDs Are Not Stable: Business-Key Comparison
+
+Sometimes you can't rely on `_id`. A document pipeline that generates IDs at ingestion time will assign a different `_id` each time the same record is processed. If `index-a` and `index-b` were populated by two such pipelines, the same employee record might have `_id: "abc123"` in one index and `_id: "xyz789"` in the other — even though the underlying data is identical.
+
+In this case you need to match documents by content rather than by ID. The key is to identify a set of fields that together form a unique business key.
+
+For an employee dataset, a reasonable business key is `(first_name, last_name, birth_date)`. A document in `index-a` is "missing" from `index-b` if no document in `index-b` has the same combination of those three fields.
+
+### 3a — Scan the source with PIT + `search_after`
+
+Open a [Point-in-Time (PIT)](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-open-point-in-time) on the source index to get a consistent snapshot, then paginate through it fetching only the business-key fields:
 
 ```bash
 ./escli open_point_in_time index-a 5m
+# → { "id": "46ToAwMDaWR..." }
 ```
-
-The response contains a `id` field — save it, you'll use it on every subsequent search request:
-
-```json
-{ "id": "46ToAwMDaWR..." }
-```
-
-When the scan is complete (or if an error occurs), always close the PIT to release server resources:
-
-```bash
-./escli close_point_in_time <<< '{"id": "46ToAwMDaWR..."}'
-```
-
-## Step 3 — Paginate Through Document IDs Using `search_after`
-
-With the PIT open, paginate through `index-a` in batches using `search_after`. Setting `"_source": false` means Elasticsearch only reads the `_id` field — no document content is transferred, which keeps each page fast and lightweight.
-
-For the first page:
 
 ```bash
 ./escli search <<< '{
   "size": 10000,
-  "_source": false,
+  "_source": ["first_name", "last_name", "birth_date"],
   "pit": { "id": "46ToAwMDaWR...", "keep_alive": "5m" },
   "sort": [{ "_shard_doc": "asc" }]
 }'
 ```
 
-The sort key `_shard_doc` is the most efficient sort for full-index pagination: it uses the internal Lucene document order with no overhead.
-
-For subsequent pages, take the `sort` value of the last hit and pass it as `search_after`:
+The sort key `_shard_doc` is the most efficient sort for full-index pagination: it uses the internal Lucene document order with no overhead. Repeat with `search_after` until the response contains zero hits. Always close the PIT when done:
 
 ```bash
-./escli search <<< '{
-  "size": 10000,
-  "_source": false,
-  "pit": { "id": "46ToAwMDaWR...", "keep_alive": "5m" },
-  "sort": [{ "_shard_doc": "asc" }],
-  "search_after": [1234567]
-}'
+./escli close_point_in_time <<< '{"id": "46ToAwMDaWR..."}'
 ```
 
-Elasticsearch may return an updated PIT ID in each response — always use the latest one for the next request.
+### 3b — Check each page against the target via `_msearch`
 
-Repeat until the response contains zero hits: that signals the end of the index.
-
-## Step 4 — Batch-Check Existence in the Target Index via `_mget`
-
-For each page of IDs collected in the previous step, issue a single `_mget` request against `index-b`. This checks hundreds or thousands of IDs in one round-trip without fetching any document content.
+For each page of source documents, build one `_msearch` request with one sub-query per document. Each sub-query uses a `bool/must` on the three business-key fields and requests `size: 0` — we only need to know whether a match exists, not retrieve the document itself.
 
 ```bash
-./escli mget --index index-b --_source false <<< '{
-  "ids": ["id-000001", "id-000002", "id-000003", "..."]
-}'
+./escli msearch << 'EOF'
+{"index": "index-b"}
+{"size":0,"query":{"bool":{"must":[{"term":{"first_name.keyword":"Alice1"}},{"term":{"last_name.keyword":"Smith"}},{"term":{"birth_date":"1985-03-12"}}]}}}
+{"index": "index-b"}
+{"size":0,"query":{"bool":{"must":[{"term":{"first_name.keyword":"Bob2"}},{"term":{"last_name.keyword":"Jones"}},{"term":{"birth_date":"1990-07-24"}}]}}}
+EOF
 ```
 
-The response contains one entry per requested ID, each with a `found` flag:
+The response contains one entry per sub-query, in the same order:
 
 ```json
 {
-  "docs": [
-    { "_id": "id-000001", "found": true  },
-    { "_id": "id-000002", "found": false },
-    { "_id": "id-000003", "found": true  }
+  "responses": [
+    { "hits": { "total": { "value": 1 } } },
+    { "hits": { "total": { "value": 0 } } }
   ]
 }
 ```
 
-Any entry where `"found": false` is a document missing from `index-b`. Collect those IDs — those are what you need to fix.
+`total.value == 0` means no document in `index-b` matches that business key — the document is missing. Collect the corresponding `_id` from the source page.
 
-## Step 5 — Reindex Missing Documents via `_reindex`
+> **Why `_msearch` instead of a single `bool/should`?**
+> A `bool/should` query combining all source documents into one request would return at most `size` results, silently truncating matches when there are more documents than the page size. `_msearch` sends one independent sub-query per document — each gets its own `total.value` — so there is no truncation.
 
-Once you have the list of missing IDs, use the `_reindex` API with an `ids` query to copy them from `index-a` into `index-b`. The key advantage over fetching and re-posting documents yourself is that **everything happens server-side**: Elasticsearch reads documents directly from the source shard and writes them to the destination, without any document content ever crossing the network to your client.
+> **Note on `.keyword` sub-fields**: `term` queries require exact (keyword) matching. The `first_name` and `last_name` fields must have a `.keyword` sub-field in the index mapping. The demo's `mapping.json` includes this.
 
-Process the missing IDs in batches (10,000 at a time is a good default):
+### 3c — Speed it up with `split-by-date`
 
-```bash
-./escli reindex <<< '{
-  "source": {
-    "index": "index-a",
-    "query": { "ids": { "values": ["id-000002", "id-000007", "..."] } }
-  },
-  "dest": { "index": "index-b" }
-}'
+If the business key includes a date field, you can partition the source into date slices and run each slice as an independent job. Each slice opens its own PIT with a `range` filter on `birth_date`, runs its own msearch loop, and writes its results to a separate file. The parent script launches all slices in parallel and aggregates the results when they are all done.
+
 ```
+[compare] Launching 5 slices in parallel...
 
-The response tells you exactly how many documents were created or updated:
-
-```json
-{
-  "total": 10000,
-  "created": 10000,
-  "updated": 0,
-  "failures": []
-}
+  → Slice 1: 1960-01-01 → 1969-12-31 ✅ — 244408 checked, 12207 missing
+  → Slice 2: 1970-01-01 → 1979-12-31 ✅ — 243624 checked, 12212 missing
+  → Slice 3: 1980-01-01 → 1989-12-31 ✅ — 243551 checked, 11921 missing
+  → Slice 4: 1990-01-01 → 1999-12-31 ✅ — 243895 checked, 11991 missing
+  → Slice 5: 2000-01-01 → 2009-12-31 ✅ — 24522 checked, 1263 missing
 ```
-
-Repeat for each batch until all missing IDs have been processed.
 
 ## Performance on a 1M Dataset
 
-To validate the approach, the demo generates 1,000,000 documents into `index-a` and deliberately skips ~5% of them in `index-b`, then runs the full compare → reindex cycle.
+To validate the approaches, the demo generates 1,000,000 documents in `index-a` and deliberately skips ~5% in `index-b` (49,594 missing documents), then runs the full compare → reindex cycle.
 
 Results on a MacBook M3 Pro:
 
@@ -176,47 +182,45 @@ Results on a MacBook M3 Pro:
 ```txt
 Documents generated:                 1000000
 Indexed into index-a:                1000000
-Indexed into index-b:                949443
-Skipped from index-b:                50557
+Indexed into index-b:                950406
 Effective miss rate:                 ~5%
-index-a batch stats (50 batches):    avg 2s build, 0s index
-index-b batch stats (48 batches):    avg 2s build, 0s index
 Duration:                            2m 30s
 ```
 
-The dataset generation is CPU-bound on the bash side (building NDJSON payloads), not I/O-bound — bulk indexing itself is near-instant.
-
 **Comparison** (`compare-indices.sh`):
 
-```txt
-Total documents in index-a:          1000000
-Total documents in index-b:          949443
-Documents checked:                   1000000
-Documents missing from index-b:      50557
-Missing rate:                        ~5%
-Duration:                            37s
-```
+| Strategy           | Duration | How it works                               |
+|--------------------|----------|--------------------------------------------|
+| `op_type=create`   | **6s**   | Full `_reindex` server-side, skips existing|
+| `querydsl`         | 37s      | PIT scan + `_mget` existence check by ID   |
+| `business-key`     | 1m 38s   | PIT scan + `_msearch` by business key      |
+| `split-by-date`    | **32s**  | Same as `business-key`, 5 slices in parallel|
 
 **Reindex of missing documents** (`reindex-missing.sh`):
 
 ```txt
-IDs read from input file:            50557
-Documents re-indexed into index-b:   50557
+IDs read from input file:            49594
+Documents re-indexed into index-b:   49594
 Duration:                            4s
 ```
 
-**37 seconds to scan 1,000,000 documents and identify 50,557 missing ones. 4 seconds to reindex them all.** The approach scales well because each network round-trip carries thousands of IDs, and `_source: false` keeps the search pages small.
+The `op_type=create` approach is fastest because everything is server-side and requires no client-side scanning. The `split-by-date` strategy brings the business-key approach within range of the `querydsl` strategy through parallelism.
 
-There is also a trick here. As we are just checking for the document `_id` field, the `_mget` requests are extremely fast. If we were fetching `_source` to compare content, the network and deserialization overhead would be much higher, and the performance would degrade significantly.
+## Decision Tree
+
+```
+Are _id values stable between both indices?
+├── Yes → _reindex with op_type=create          (6s, server-side)
+└── No  → Do you have a reliable business key?
+          ├── Yes, simple scan is fast enough → business-key   (1m 38s)
+          └── Yes, and you need more speed    → split-by-date  (32s, parallel)
+```
 
 ## Conclusion
 
-Elasticsearch doesn't offer a native index diff command, but combining `_count`, PIT-based pagination, `_mget` existence checks, and targeted `_reindex` gives you an efficient and scalable way to identify — and fix — missing documents between two indices, without ever touching documents that are already in sync.
+Elasticsearch doesn't offer a native index diff command, but the right strategy depends on your data model:
 
-The same pattern can be extended to:
+- **Use functional `_id`s** (a natural business key like `emp_no`) whenever possible. It unlocks the simplest and fastest approach: `_reindex` with `op_type=create` finds and fills gaps in one server-side call.
+- **When IDs are unstable**, match by business key using PIT + `_msearch`. Partition by a date field and run slices in parallel to recover most of the performance.
 
-- **Detect content differences**: fetch `_source` during the scan and compare field values.
-- **Multi-index comparison**: run the same script against a list of target indices in parallel.
-- **Continuous sync monitoring**: schedule the comparison to run periodically and alert on drift.
-
-The complete demo, including dataset generation and reindex scripts, is available at [[URL_PLACE_HOLDER](https://github.com/dadoonet/blog-compare-indices/)].
+The complete demo — dataset generation, comparison scripts, and reindex scripts — is available at [[URL_PLACE_HOLDER](https://github.com/dadoonet/blog-compare-indices/)].
