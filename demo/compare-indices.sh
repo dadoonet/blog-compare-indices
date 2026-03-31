@@ -278,10 +278,12 @@ fi
 
 # ── strategy: split-by-date ──────────────────────────────────────────────────
 # Partitions the source index into birth_date slices of SLICE_YEARS years each.
-# Each slice runs the same msearch business-key logic with a range filter on
-# birth_date, reducing per-pass volume and making slices independently scannable.
+# Each slice runs independently in a background job (parallel), opening its own
+# PIT and running the same msearch business-key logic with a range filter.
+# In TTY mode a live status block is updated in place; results are aggregated
+# after all jobs complete.
 if [[ "$STRATEGY" == "split-by-date" ]]; then
-    # 1. Aggregate min/max birth_date to determine the slice boundaries
+    # 1. Aggregate min/max birth_date to determine slice boundaries
     log "Aggregating birth_date range on ${INDEX_A}..."
     DATE_AGG=$("$ESCLI" search --index "$INDEX_A" <<< \
         '{"size":0,"aggs":{"min_d":{"min":{"field":"birth_date"}},"max_d":{"max":{"field":"birth_date"}}}}')
@@ -294,54 +296,49 @@ if [[ "$STRATEGY" == "split-by-date" ]]; then
     OUTPUT_PATH="${SCRIPT_DIR}/${OUTPUT_FILE}"
     > "$OUTPUT_PATH"
 
-    # Current PIT ID — updated before each slice so the EXIT trap can close it on error
-    SD_PIT_ID=""
-    close_pit() {
-        local exit_code=$?
-        [ -n "$SD_PIT_ID" ] && \
-            "$ESCLI" close_point_in_time <<< "{\"id\":\"${SD_PIT_ID}\"}" >/dev/null 2>&1 || true
-        exit $exit_code
+    SLICE_TMPDIR=$(mktemp -d)
+    _sbd_cleanup() {
+        jobs -p 2>/dev/null | while IFS= read -r pid; do kill "$pid" 2>/dev/null || true; done
+        rm -rf "$SLICE_TMPDIR"
     }
-    trap close_pit EXIT
+    trap _sbd_cleanup EXIT
 
-    TOTAL_CHECKED=0
-    MISSING_COUNT=0
-    TOTAL_PAGES=0
-    TOTAL_SEARCH_MS=0
-    TOTAL_MSEARCH_MS=0
-    SLICE_NUM=0
+    # ── Per-slice worker — runs in a subshell (called with &) ────────────────
+    # Writes missing IDs to ${SLICE_TMPDIR}/missing_N.txt
+    # Writes key=value stats to ${SLICE_TMPDIR}/stats_N.txt (atomic rename)
+    _run_slice() {
+        local slice_num=$1 gte=$2 lte=$3
 
-    # 2. Iterate over date slices
-    SLICE_START=$MIN_YEAR
-    while (( SLICE_START <= MAX_YEAR )); do
-        SLICE_END=$(( SLICE_START + SLICE_YEARS - 1 ))
-        SLICE_GTE="${SLICE_START}-01-01"
-        SLICE_LTE="${SLICE_END}-12-31"
-        SLICE_NUM=$(( SLICE_NUM + 1 ))
+        trap - EXIT
+        _SLICE_PIT=""
+        _slice_pit_close() {
+            [ -n "$_SLICE_PIT" ] && \
+                "$ESCLI" close_point_in_time <<< "{\"id\":\"${_SLICE_PIT}\"}" >/dev/null 2>&1 || true
+        }
+        trap _slice_pit_close EXIT
 
-        log "Slice ${SLICE_NUM}: ${SLICE_GTE} → ${SLICE_LTE}"
-        (( IS_TTY )) || echo ""
+        _SLICE_PIT=$("$ESCLI" open_point_in_time "$INDEX_A" "$PIT_KEEP_ALIVE" | jq -r '.id // empty')
+        [ -z "$_SLICE_PIT" ] && { warn "Slice ${slice_num}: failed to open PIT"; exit 1; }
 
-        SD_PIT_ID=$("$ESCLI" open_point_in_time "$INDEX_A" "$PIT_KEEP_ALIVE" | jq -r '.id // empty')
-        [ -z "$SD_PIT_ID" ] && die "Failed to open PIT for slice ${SLICE_NUM}."
+        local out_missing="${SLICE_TMPDIR}/missing_${slice_num}.txt"
+        local out_stats="${SLICE_TMPDIR}/stats_${slice_num}.txt"
+        > "$out_missing"
 
-        SEARCH_AFTER="null"
-        SLICE_CHECKED=0
-        SLICE_MISSING=0
-        PAGE=0
-        _PROG_INIT=0   # reset progress line for each slice
+        local search_after="null"
+        local slice_checked=0 slice_missing=0 page=0
+        local total_search_ms=0 total_msearch_ms=0
 
-        # 3. Paginate through this date slice
         while true; do
-            PAGE=$(( PAGE + 1 ))
+            page=$(( page + 1 ))
 
-            SEARCH_BODY=$(jq -n \
-                --arg    pit_id        "$SD_PIT_ID"      \
-                --argjson search_after "$SEARCH_AFTER"   \
+            local search_body
+            search_body=$(jq -n \
+                --arg    pit_id        "$_SLICE_PIT"     \
+                --argjson search_after "$search_after"   \
                 --argjson size         "$BATCH_SIZE"     \
                 --arg    keep_alive    "$PIT_KEEP_ALIVE" \
-                --arg    gte           "$SLICE_GTE"      \
-                --arg    lte           "$SLICE_LTE"      \
+                --arg    gte           "$gte"            \
+                --arg    lte           "$lte"            \
                 '{
                     "size": $size,
                     "_source": ["first_name", "last_name", "birth_date"],
@@ -350,33 +347,37 @@ if [[ "$STRATEGY" == "split-by-date" ]]; then
                     "query": {"range": {"birth_date": {"gte": $gte, "lte": $lte}}}
                 } + (if $search_after != null then {"search_after": $search_after} else {} end)')
 
-            SEARCH_START=$(now_ms)
-            SEARCH_RESPONSE=$("$ESCLI" search <<< "$SEARCH_BODY")
-            SEARCH_MS=$(( $(now_ms) - SEARCH_START ))
-            TOTAL_SEARCH_MS=$(( TOTAL_SEARCH_MS + SEARCH_MS ))
+            local search_start search_response search_ms
+            search_start=$(now_ms)
+            search_response=$("$ESCLI" search <<< "$search_body")
+            search_ms=$(( $(now_ms) - search_start ))
+            total_search_ms=$(( total_search_ms + search_ms ))
 
-            NEW_PIT_ID=$(echo "$SEARCH_RESPONSE" | jq -r '.pit_id // empty')
-            [ -n "$NEW_PIT_ID" ] && SD_PIT_ID="$NEW_PIT_ID"
+            local new_pit_id
+            new_pit_id=$(echo "$search_response" | jq -r '.pit_id // empty')
+            [ -n "$new_pit_id" ] && _SLICE_PIT="$new_pit_id"
 
-            HITS=$(echo "$SEARCH_RESPONSE" | jq -c '.hits.hits')
-            HIT_COUNT=$(echo "$HITS" | jq 'length')
-            (( HIT_COUNT == 0 )) && break
+            local hits hit_count
+            hits=$(echo "$search_response" | jq -c '.hits.hits')
+            hit_count=$(echo "$hits" | jq 'length')
+            (( hit_count == 0 )) && break
 
-            SLICE_CHECKED=$(( SLICE_CHECKED + HIT_COUNT ))
-            SEARCH_AFTER=$(echo "$HITS" | jq -c '.[-1].sort')
+            slice_checked=$(( slice_checked + hit_count ))
+            search_after=$(echo "$hits" | jq -c '.[-1].sort')
 
-            FILTERED=$(echo "$HITS" | jq -c '[.[] | select(
+            local filtered filtered_count
+            filtered=$(echo "$hits" | jq -c '[.[] | select(
                 ._source.first_name != null and
                 ._source.last_name  != null and
                 ._source.birth_date != null
             )]')
-            FILTERED_COUNT=$(echo "$FILTERED" | jq 'length')
-            MSEARCH_MS=0
+            filtered_count=$(echo "$filtered" | jq 'length')
 
-            if (( FILTERED_COUNT > 0 )); then
-                IDS=$(echo "$FILTERED" | jq -c '[.[]._id]')
+            if (( filtered_count > 0 )); then
+                local ids msearch_body msearch_start msearch_response msearch_ms missing_ids
+                ids=$(echo "$filtered" | jq -c '[.[]._id]')
 
-                MSEARCH_BODY=$(echo "$FILTERED" | jq -r \
+                msearch_body=$(echo "$filtered" | jq -r \
                     --arg idx "$INDEX_B" \
                     '.[] | (
                         ({"index": $idx} | tojson),
@@ -390,39 +391,146 @@ if [[ "$STRATEGY" == "split-by-date" ]]; then
                         } | tojson)
                     )')
 
-                MSEARCH_START=$(now_ms)
-                MSEARCH_RESPONSE=$("$ESCLI" msearch <<< "$MSEARCH_BODY")
-                MSEARCH_MS=$(( $(now_ms) - MSEARCH_START ))
-                TOTAL_MSEARCH_MS=$(( TOTAL_MSEARCH_MS + MSEARCH_MS ))
+                msearch_start=$(now_ms)
+                msearch_response=$("$ESCLI" msearch <<< "$msearch_body")
+                msearch_ms=$(( $(now_ms) - msearch_start ))
+                total_msearch_ms=$(( total_msearch_ms + msearch_ms ))
 
-                MISSING_IDS=$(echo "$MSEARCH_RESPONSE" | jq -r \
-                    --argjson ids "$IDS" \
+                missing_ids=$(echo "$msearch_response" | jq -r \
+                    --argjson ids "$ids" \
                     '.responses | to_entries[] |
                      select(.value.hits.total.value == 0) |
                      $ids[.key]')
 
-                if [ -n "$MISSING_IDS" ]; then
-                    echo "$MISSING_IDS" >> "$OUTPUT_PATH"
-                    PAGE_MISSING=$(echo "$MISSING_IDS" | wc -l | tr -d ' ')
-                    SLICE_MISSING=$(( SLICE_MISSING + PAGE_MISSING ))
+                if [ -n "$missing_ids" ]; then
+                    echo "$missing_ids" >> "$out_missing"
+                    slice_missing=$(( slice_missing + $(echo "$missing_ids" | wc -l | tr -d ' ') ))
                 fi
             fi
-
-            _progress "Page ${PAGE} $(progress_bar $SLICE_CHECKED $COUNT_A) - ⏳ search: $(format_ms $SEARCH_MS), msearch: $(format_ms $MSEARCH_MS)"
         done
 
-        "$ESCLI" close_point_in_time <<< "{\"id\":\"${SD_PIT_ID}\"}" >/dev/null 2>&1 || true
-        SD_PIT_ID=""
+        "$ESCLI" close_point_in_time <<< "{\"id\":\"${_SLICE_PIT}\"}" >/dev/null 2>&1 || true
+        _SLICE_PIT=""
+        trap - EXIT
 
-        TOTAL_CHECKED=$(( TOTAL_CHECKED + SLICE_CHECKED ))
-        MISSING_COUNT=$(( MISSING_COUNT + SLICE_MISSING ))
-        TOTAL_PAGES=$(( TOTAL_PAGES + PAGE ))
+        # Atomic write: rename so the polling loop never sees a partial file
+        printf 'SLICE_CHECKED=%d\nSLICE_MISSING=%d\nSLICE_PAGES=%d\nSLICE_SEARCH_MS=%d\nSLICE_MSEARCH_MS=%d\n' \
+            "$slice_checked" "$slice_missing" "$page" "$total_search_ms" "$total_msearch_ms" \
+            > "${out_stats}.tmp"
+        mv "${out_stats}.tmp" "$out_stats"
 
-        (( IS_TTY && _PROG_INIT )) && printf "\r\033[K" || echo ""
-        info "Slice ${SLICE_NUM} done: ${SLICE_CHECKED} checked, ${SLICE_MISSING} missing"
+        # In non-TTY mode the parent has no live display — print completion here
+        (( IS_TTY )) || info "Slice ${slice_num} done: ${slice_checked} checked, ${slice_missing} missing"
+    }
 
+    # 2. Compute all slice boundaries upfront
+    SLICE_NUM=0
+    SLICE_START=$MIN_YEAR
+    SLICE_GTES=()
+    SLICE_LTES=()
+    while (( SLICE_START <= MAX_YEAR )); do
+        SLICE_GTES+=("${SLICE_START}-01-01")
+        SLICE_LTES+=("$(( SLICE_START + SLICE_YEARS - 1 ))-12-31")
+        SLICE_NUM=$(( SLICE_NUM + 1 ))
         SLICE_START=$(( SLICE_START + SLICE_YEARS ))
     done
+
+    # 3. Print initial status block (TTY) then launch all slices
+    if (( IS_TTY )); then
+        log "Launching ${SLICE_NUM} slices in parallel..."
+        echo ""
+        for (( s=1; s<=SLICE_NUM; s++ )); do
+            printf "  → Slice %d: %s → %s ⏳\n" \
+                "$s" "${SLICE_GTES[$((s-1))]}" "${SLICE_LTES[$((s-1))]}"
+        done
+    else
+        log "Launching ${SLICE_NUM} slices in parallel..."
+    fi
+
+    SLICE_PIDS=()
+    for (( s=1; s<=SLICE_NUM; s++ )); do
+        _run_slice "$s" "${SLICE_GTES[$((s-1))]}" "${SLICE_LTES[$((s-1))]}" &
+        SLICE_PIDS+=($!)
+    done
+
+    # 4. Monitor progress
+    FAILED_SLICES=0
+    SLICE_DONE=()
+    for (( s=1; s<=SLICE_NUM; s++ )); do SLICE_DONE[$s]=0; done
+    COMPLETED=0
+
+    if (( IS_TTY )); then
+        # Cursor is currently at the line below the last slice status line.
+        # To update slice s: move up (SLICE_NUM - s + 1) lines, rewrite, move back down.
+        while (( COMPLETED < SLICE_NUM )); do
+            sleep 0.3
+            for (( s=1; s<=SLICE_NUM; s++ )); do
+                [ "${SLICE_DONE[$s]}" = "1" ] && continue
+
+                local_ok=1
+                if [ -f "${SLICE_TMPDIR}/stats_${s}.txt" ]; then
+                    : # success
+                elif ! kill -0 "${SLICE_PIDS[$((s-1))]}" 2>/dev/null; then
+                    local_ok=0  # PID gone, no stats file → failed
+                else
+                    continue    # still running
+                fi
+
+                SLICE_DONE[$s]=1
+                COMPLETED=$(( COMPLETED + 1 ))
+
+                lines_up=$(( SLICE_NUM - s + 1 ))
+                lines_down=$(( SLICE_NUM - s ))
+                printf "\033[%dA\r\033[K" "$lines_up"
+
+                if (( local_ok )); then
+                    SLICE_CHECKED=0; SLICE_MISSING=0
+                    source "${SLICE_TMPDIR}/stats_${s}.txt"
+                    printf "  → Slice %d: %s → %s ✅ — %d checked, %d missing\n" \
+                        "$s" "${SLICE_GTES[$((s-1))]}" "${SLICE_LTES[$((s-1))]}" \
+                        "$SLICE_CHECKED" "$SLICE_MISSING"
+                else
+                    printf "  → Slice %d: %s → %s ❌ (failed)\n" \
+                        "$s" "${SLICE_GTES[$((s-1))]}" "${SLICE_LTES[$((s-1))]}"
+                    FAILED_SLICES=$(( FAILED_SLICES + 1 ))
+                fi
+
+                (( lines_down > 0 )) && printf "\033[%dB" "$lines_down"
+            done
+        done
+        # Reap background processes (they are already done at this point)
+        for pid in "${SLICE_PIDS[@]}"; do wait "$pid" 2>/dev/null || true; done
+    else
+        for i in "${!SLICE_PIDS[@]}"; do
+            wait "${SLICE_PIDS[$i]}" || FAILED_SLICES=$(( FAILED_SLICES + 1 ))
+        done
+    fi
+
+    (( FAILED_SLICES > 0 )) && die "${FAILED_SLICES} slice(s) failed."
+
+    # 5. Aggregate results from all slices (in slice order)
+    TOTAL_CHECKED=0
+    MISSING_COUNT=0
+    TOTAL_PAGES=0
+    TOTAL_SEARCH_MS=0
+    TOTAL_MSEARCH_MS=0
+
+    for (( s=1; s<=SLICE_NUM; s++ )); do
+        [ -f "${SLICE_TMPDIR}/missing_${s}.txt" ] && \
+            cat "${SLICE_TMPDIR}/missing_${s}.txt" >> "$OUTPUT_PATH" || true
+        if [ -f "${SLICE_TMPDIR}/stats_${s}.txt" ]; then
+            SLICE_CHECKED=0; SLICE_MISSING=0; SLICE_PAGES=0; SLICE_SEARCH_MS=0; SLICE_MSEARCH_MS=0
+            source "${SLICE_TMPDIR}/stats_${s}.txt"
+            TOTAL_CHECKED=$(( TOTAL_CHECKED + SLICE_CHECKED ))
+            MISSING_COUNT=$(( MISSING_COUNT + SLICE_MISSING ))
+            TOTAL_PAGES=$(( TOTAL_PAGES + SLICE_PAGES ))
+            TOTAL_SEARCH_MS=$(( TOTAL_SEARCH_MS + SLICE_SEARCH_MS ))
+            TOTAL_MSEARCH_MS=$(( TOTAL_MSEARCH_MS + SLICE_MSEARCH_MS ))
+        fi
+    done
+
+    rm -rf "$SLICE_TMPDIR"
+    trap - EXIT
 
     echo ""
     log "Comparison complete."
@@ -434,7 +542,7 @@ if [[ "$STRATEGY" == "split-by-date" ]]; then
         PCT=$(( MISSING_COUNT * 100 / TOTAL_CHECKED ))
         printf "  %-38s ~%d%%\n" "Missing rate:" "$PCT"
     fi
-    printf "  %-38s %d (${SLICE_YEARS}-year slices)\n" "Date slices:" "$SLICE_NUM"
+    printf "  %-38s %d (${SLICE_YEARS}-year slices, parallel)\n" "Date slices:" "$SLICE_NUM"
     if (( TOTAL_PAGES > 0 )); then
         printf "  %-38s search:  total %s, avg %s/page\n" \
             "Scan stats (${TOTAL_PAGES} pages):" \
