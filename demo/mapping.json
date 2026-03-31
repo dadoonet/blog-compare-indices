@@ -1,0 +1,20 @@
+{
+  "mappings": {
+    "properties": {
+      "avg_worked_seconds": { "type": "long" },
+      "birth_date":         { "type": "date" },
+      "emp_no":             { "type": "long" },
+      "first_name":         { "type": "text", "fields": { "keyword": { "type": "keyword" } } },
+      "gender":             { "type": "keyword" },
+      "height":             { "type": "float" },
+      "hire_date":          { "type": "date" },
+      "is_rehired":         { "type": "boolean" },
+      "job_positions":      { "type": "keyword" },
+      "languages":          { "type": "long" },
+      "last_name":          { "type": "text", "fields": { "keyword": { "type": "keyword" } } },
+      "salary":             { "type": "long" },
+      "salary_change":      { "type": "float" },
+      "still_hired":        { "type": "boolean" }
+    }
+  }
+}

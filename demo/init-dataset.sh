@@ -6,11 +6,13 @@
 # controlled by MISS_RATE. Documents are skipped individually (not in blocks)
 # so that the distribution is uniform across the index.
 #
-# Document IDs use a zero-padded counter: id-000001, id-000002, …
-# This makes them easy to sort, inspect, and validate manually.
+# Document IDs are built as {emp_no}_{counter} (e.g. "10010_1", "10010_365").
+# This makes _id functional (tied to the employee) while remaining globally unique.
+# Each document's birth_date is replaced with a random date in [1960, 2000] so
+# that (first_name, last_name, birth_date) forms a near-unique business key.
 #
-# Bulk files are cached in dataset/ and reused if the document count matches.
-# Delete dataset/bulk-*.ndjson to force regeneration.
+# Bulk files are cached in dataset/ and reused if the document count and _id
+# format match. Delete dataset/bulk-*.ndjson to force full regeneration.
 #
 # Usage: ./init-dataset.sh [options]
 #   --num-docs <n>         Documents to generate         (default: 1000000)
@@ -28,6 +30,7 @@ source "${SCRIPT_DIR}/lib/utils.sh"
 SECONDS=0   # bash built-in: counts elapsed seconds automatically
 
 ESCLI_BIN="${SCRIPT_DIR}/escli"
+MAPPING_FILE="${SCRIPT_DIR}/mapping.json"
 
 # ── Load defaults from .env, then allow CLI overrides ─────────────────────────
 set -a && set +u && source "${SCRIPT_DIR}/.env.sh" && set -u && set +a
@@ -52,7 +55,8 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-[ -f "$ESCLI_BIN" ] || die "escli not found at ${ESCLI_BIN}. Run ./setup.sh first."
+[ -f "$ESCLI_BIN" ]    || die "escli not found at ${ESCLI_BIN}. Run ./setup.sh first."
+[ -f "$MAPPING_FILE" ] || die "Mapping file not found: ${MAPPING_FILE}."
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -66,15 +70,33 @@ delete_index() {
     fi
 }
 
+# Create an index with the shared mapping (mapping.json)
+create_index() {
+    local index="$1"
+    "$ESCLI_BIN" indices create "$index" --input "$MAPPING_FILE" &>/dev/null
+    info "Created index with mapping: ${index}"
+}
+
 # ── Load employee dataset into memory ─────────────────────────────────────────
+# Three parallel arrays are built from a single pass over the dataset file:
+#   EMPLOYEES[]        — full JSON document per employee
+#   EMP_NOS[]          — emp_no value (used as _id prefix)
+#   ORIG_BIRTH_DATES[] — original birth_date string (replaced at generation time)
+# All three share the same index so IDX safely addresses all three arrays.
 DATASET_FILE="${SCRIPT_DIR}/dataset/employees.ndjson"
 [ -f "$DATASET_FILE" ] || die "Dataset not found: ${DATASET_FILE}. Run ./setup.sh first."
 EMPLOYEES=()
+EMP_NOS=()
+ORIG_BIRTH_DATES=()
 if (( BASH_VERSINFO[0] >= 4 )); then
-    mapfile -t EMPLOYEES < "$DATASET_FILE"
+    mapfile -t EMPLOYEES        < "$DATASET_FILE"
+    mapfile -t EMP_NOS          < <(jq -r '.emp_no'     "$DATASET_FILE")
+    mapfile -t ORIG_BIRTH_DATES < <(jq -r '.birth_date' "$DATASET_FILE")
 else
     # mapfile is bash 4+; fall back to a read loop for bash 3.x (macOS system bash)
     while IFS= read -r line; do EMPLOYEES+=("$line"); done < "$DATASET_FILE"
+    while IFS= read -r v; do EMP_NOS+=("$v");          done < <(jq -r '.emp_no'     "$DATASET_FILE")
+    while IFS= read -r v; do ORIG_BIRTH_DATES+=("$v"); done < <(jq -r '.birth_date' "$DATASET_FILE")
 fi
 EMPLOYEE_COUNT=${#EMPLOYEES[@]}
 info "Loaded ${EMPLOYEE_COUNT} employee records from $(basename "$DATASET_FILE")"
@@ -140,15 +162,20 @@ _show_inline() {
 }
 
 # ── 1. Check cache validity ────────────────────────────────────────────────────
+# Two conditions must hold: correct line count AND the new _id format (emp_no_i).
+# If the cache was generated with the old counter format ("id-NNNNNN"), invalidate it.
 NEED_GENERATE=true
 if [[ -f "$BULK_A_CACHE" && -f "$BULK_B_CACHE" ]]; then
     ACTUAL_LINES=$(wc -l < "$BULK_A_CACHE" | tr -d ' ')
-    if (( ACTUAL_LINES == EXPECTED_LINES_A )); then
+    read -r _CACHE_FIRST_LINE < "$BULK_A_CACHE"
+    if (( ACTUAL_LINES == EXPECTED_LINES_A )) && [[ "$_CACHE_FIRST_LINE" != *'"_id":"id-'* ]]; then
         COUNT_A=$NUM_DOCS
         COUNT_B=$(( $(wc -l < "$BULK_B_CACHE" | tr -d ' ') / 2 ))
         COUNT_SKIP=$(( NUM_DOCS - COUNT_B ))
         log "Cache valid — ${NUM_DOCS} docs, skipping generation."
         NEED_GENERATE=false
+    elif [[ "$_CACHE_FIRST_LINE" == *'"_id":"id-'* ]]; then
+        warn "Cache uses old _id format (id-NNNNNN) — regenerating with emp_no_i format..."
     else
         warn "Cache mismatch (expected ${EXPECTED_LINES_A} lines, got ${ACTUAL_LINES}). Regenerating..."
     fi
@@ -171,10 +198,20 @@ if $NEED_GENERATE; then
     # for (( )) avoids the $(seq ...) subshell
     for (( i=1; i<=NUM_DOCS; i++ )); do
 
-        # Pick a random employee document from the in-memory array.
-        # The bulk header is built once — it's identical for both indices.
-        DOC="${EMPLOYEES[$(( RANDOM % EMPLOYEE_COUNT ))]}"
-        printf -v HEADER '{"index":{"_id":"id-%06d"}}' "$i"
+        # Pick a random employee from the in-memory arrays (all three share the same index).
+        IDX=$(( RANDOM % EMPLOYEE_COUNT ))
+        DOC="${EMPLOYEES[$IDX]}"
+
+        # _id = emp_no + global counter → unique and traceable back to the source employee.
+        printf -v HEADER '{"index":{"_id":"%s_%d"}}' "${EMP_NOS[$IDX]}" "$i"
+
+        # Replace the employee's original birth_date with a random date [1960, 2000].
+        # bash literal substitution (no subshell) keeps the loop O(1) per iteration.
+        YEAR=$(( 1960 + RANDOM % 41 ))
+        MONTH=$(( 1 + RANDOM % 12 ))
+        DAY=$(( 1 + RANDOM % 28 ))
+        printf -v NEW_BD '%04d-%02d-%02d' "$YEAR" "$MONTH" "$DAY"
+        DOC="${DOC/"${ORIG_BIRTH_DATES[$IDX]}"/"$NEW_BD"}"
 
         printf '%s\n%s\n' "$HEADER" "$DOC" >&3
         COUNT_A=$(( COUNT_A + 1 ))
@@ -209,10 +246,13 @@ if $NEED_GENERATE; then
     log "Generated ${NUM_DOCS} documents in $(format_ms $GEN_MS)."
 fi
 
-# ── 3. Delete existing indices ─────────────────────────────────────────────────
+# ── 3. Delete and recreate indices with explicit mapping ───────────────────────
 log "Deleting existing indices..."
 delete_index "$INDEX_A"
 delete_index "$INDEX_B"
+log "Creating indices with mapping..."
+create_index "$INDEX_A"
+create_index "$INDEX_B"
 
 # ── 4. Index from cache files ──────────────────────────────────────────────────
 # escli utils load handles batching internally (--size docs per bulk request).
