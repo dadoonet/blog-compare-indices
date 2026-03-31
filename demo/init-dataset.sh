@@ -8,8 +8,9 @@
 #
 # Document IDs are built as {emp_no}_{counter} (e.g. "10010_1", "10010_365").
 # This makes _id functional (tied to the employee) while remaining globally unique.
-# Each document's birth_date is replaced with a random date in [1960, 2000] so
-# that (first_name, last_name, birth_date) forms a near-unique business key.
+# Each document's first_name is suffixed with the counter (e.g. "Alice156") and
+# birth_date is replaced with a random date in [1960, 2000] so that
+# (first_name, last_name, birth_date) forms a globally unique business key.
 #
 # Bulk files are cached in dataset/ and reused if the document count and _id
 # format match. Delete dataset/bulk-*.ndjson to force full regeneration.
@@ -78,25 +79,29 @@ create_index() {
 }
 
 # ── Load employee dataset into memory ─────────────────────────────────────────
-# Three parallel arrays are built from a single pass over the dataset file:
+# Four parallel arrays are built from a single pass over the dataset file:
 #   EMPLOYEES[]        — full JSON document per employee
 #   EMP_NOS[]          — emp_no value (used as _id prefix)
 #   ORIG_BIRTH_DATES[] — original birth_date string (replaced at generation time)
-# All three share the same index so IDX safely addresses all three arrays.
+#   ORIG_FIRST_NAMES[] — original first_name string (counter suffix appended at generation time)
+# All four share the same index so IDX safely addresses all arrays.
 DATASET_FILE="${SCRIPT_DIR}/dataset/employees.ndjson"
 [ -f "$DATASET_FILE" ] || die "Dataset not found: ${DATASET_FILE}. Run ./setup.sh first."
 EMPLOYEES=()
 EMP_NOS=()
 ORIG_BIRTH_DATES=()
+ORIG_FIRST_NAMES=()
 if (( BASH_VERSINFO[0] >= 4 )); then
     mapfile -t EMPLOYEES        < "$DATASET_FILE"
-    mapfile -t EMP_NOS          < <(jq -r '.emp_no'     "$DATASET_FILE")
-    mapfile -t ORIG_BIRTH_DATES < <(jq -r '.birth_date' "$DATASET_FILE")
+    mapfile -t EMP_NOS          < <(jq -r '.emp_no'          "$DATASET_FILE")
+    mapfile -t ORIG_BIRTH_DATES < <(jq -r '.birth_date'      "$DATASET_FILE")
+    mapfile -t ORIG_FIRST_NAMES < <(jq -r '.first_name // ""' "$DATASET_FILE")
 else
     # mapfile is bash 4+; fall back to a read loop for bash 3.x (macOS system bash)
     while IFS= read -r line; do EMPLOYEES+=("$line"); done < "$DATASET_FILE"
-    while IFS= read -r v; do EMP_NOS+=("$v");          done < <(jq -r '.emp_no'     "$DATASET_FILE")
-    while IFS= read -r v; do ORIG_BIRTH_DATES+=("$v"); done < <(jq -r '.birth_date' "$DATASET_FILE")
+    while IFS= read -r v; do EMP_NOS+=("$v");          done < <(jq -r '.emp_no'          "$DATASET_FILE")
+    while IFS= read -r v; do ORIG_BIRTH_DATES+=("$v"); done < <(jq -r '.birth_date'      "$DATASET_FILE")
+    while IFS= read -r v; do ORIG_FIRST_NAMES+=("$v"); done < <(jq -r '.first_name // ""' "$DATASET_FILE")
 fi
 EMPLOYEE_COUNT=${#EMPLOYEES[@]}
 info "Loaded ${EMPLOYEE_COUNT} employee records from $(basename "$DATASET_FILE")"
@@ -162,20 +167,36 @@ _show_inline() {
 }
 
 # ── 1. Check cache validity ────────────────────────────────────────────────────
-# Two conditions must hold: correct line count AND the new _id format (emp_no_i).
-# If the cache was generated with the old counter format ("id-NNNNNN"), invalidate it.
+# Four conditions must hold:
+#   - both cache files exist
+#   - correct line count
+#   - new _id format (emp_no_i, not id-NNNNNN)
+#   - first_name has a numeric counter suffix (e.g. "Alice1")
+#   - dataset hash matches (guards against employees.ndjson being replaced/cleaned)
+DATASET_HASH_FILE="${DATASET_DIR}/.employees-hash"
+CURRENT_HASH=$(md5 -q "$DATASET_FILE" 2>/dev/null || md5sum "$DATASET_FILE" | cut -d' ' -f1)
+CACHED_HASH=""
+[ -f "$DATASET_HASH_FILE" ] && CACHED_HASH=$(cat "$DATASET_HASH_FILE")
+
 NEED_GENERATE=true
 if [[ -f "$BULK_A_CACHE" && -f "$BULK_B_CACHE" ]]; then
     ACTUAL_LINES=$(wc -l < "$BULK_A_CACHE" | tr -d ' ')
-    read -r _CACHE_FIRST_LINE < "$BULK_A_CACHE"
-    if (( ACTUAL_LINES == EXPECTED_LINES_A )) && [[ "$_CACHE_FIRST_LINE" != *'"_id":"id-'* ]]; then
+    { read -r _CACHE_FIRST_LINE; read -r _CACHE_DOC_LINE; } < "$BULK_A_CACHE"
+    if (( ACTUAL_LINES == EXPECTED_LINES_A )) && \
+       [[ "$_CACHE_FIRST_LINE" != *'"_id":"id-'* ]] && \
+       [[ "$_CACHE_DOC_LINE" =~ \"first_name\":\"[^\"]+[0-9]+\" ]] && \
+       [[ "$CURRENT_HASH" == "$CACHED_HASH" ]]; then
         COUNT_A=$NUM_DOCS
         COUNT_B=$(( $(wc -l < "$BULK_B_CACHE" | tr -d ' ') / 2 ))
         COUNT_SKIP=$(( NUM_DOCS - COUNT_B ))
         log "Cache valid — ${NUM_DOCS} docs, skipping generation."
         NEED_GENERATE=false
+    elif [[ "$CURRENT_HASH" != "$CACHED_HASH" ]]; then
+        warn "Dataset has changed (employees.ndjson hash mismatch) — regenerating..."
     elif [[ "$_CACHE_FIRST_LINE" == *'"_id":"id-'* ]]; then
-        warn "Cache uses old _id format (id-NNNNNN) — regenerating with emp_no_i format..."
+        warn "Cache uses old _id format (id-NNNNNN) — regenerating..."
+    elif [[ ! "$_CACHE_DOC_LINE" =~ \"first_name\":\"[^\"]+[0-9]+\" ]]; then
+        warn "Cache uses old first_name format (no counter suffix) — regenerating..."
     else
         warn "Cache mismatch (expected ${EXPECTED_LINES_A} lines, got ${ACTUAL_LINES}). Regenerating..."
     fi
@@ -205,8 +226,17 @@ if $NEED_GENERATE; then
         # _id = emp_no + global counter → unique and traceable back to the source employee.
         printf -v HEADER '{"index":{"_id":"%s_%d"}}' "${EMP_NOS[$IDX]}" "$i"
 
-        # Replace the employee's original birth_date with a random date [1960, 2000].
+        # Suffix first_name with the global counter to guarantee a unique business key.
         # bash literal substitution (no subshell) keeps the loop O(1) per iteration.
+        # Employees with a null first_name get "Employee<i>" as a placeholder.
+        ORIG_FN="${ORIG_FIRST_NAMES[$IDX]}"
+        if [[ -n "$ORIG_FN" ]]; then
+            DOC="${DOC/"\"first_name\":\"${ORIG_FN}\""/"\"first_name\":\"${ORIG_FN}${i}\""}"
+        else
+            DOC="${DOC/"\"first_name\":null"/"\"first_name\":\"Employee${i}\""}"
+        fi
+
+        # Replace the employee's original birth_date with a random date [1960, 2000].
         YEAR=$(( 1960 + RANDOM % 41 ))
         MONTH=$(( 1 + RANDOM % 12 ))
         DAY=$(( 1 + RANDOM % 28 ))
@@ -234,6 +264,9 @@ if $NEED_GENERATE; then
 
     exec 3>&-
     exec 4>&-
+
+    # Persist the dataset hash so future runs can detect employees.ndjson changes
+    echo "$CURRENT_HASH" > "$DATASET_HASH_FILE"
 
     GEN_MS=$(( $(now_ms) - GEN_START ))
     _show_d "$(progress_bar $NUM_DOCS $NUM_DOCS) - ✓ generated in $(format_ms $GEN_MS)"

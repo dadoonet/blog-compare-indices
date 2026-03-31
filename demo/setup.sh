@@ -156,6 +156,27 @@ else
     fi
 fi
 if [ -f "$EMPLOYEES_FILE" ]; then
+    # ── Clean dataset: drop records with null first_name, last_name, or birth_date ──
+    # These fields are required as business keys in compare-indices.sh (business-key
+    # strategy). Records missing any of them would silently be skipped during comparison,
+    # causing the missing-doc count to differ from the querydsl strategy.
+    if command -v jq >/dev/null; then
+        TOTAL_LINES=$(wc -l < "$EMPLOYEES_FILE" | tr -d ' ')
+        CLEAN_FILE="${EMPLOYEES_FILE}.clean"
+        jq -c 'select(
+            .first_name != null and
+            .last_name  != null and
+            .birth_date != null
+        )' "$EMPLOYEES_FILE" > "$CLEAN_FILE"
+        CLEAN_LINES=$(wc -l < "$CLEAN_FILE" | tr -d ' ')
+        DROPPED=$(( TOTAL_LINES - CLEAN_LINES ))
+        if (( DROPPED > 0 )); then
+            mv "$CLEAN_FILE" "$EMPLOYEES_FILE"
+            warn "Dropped ${DROPPED} invalid record(s) (null first_name / last_name / birth_date)."
+        else
+            rm -f "$CLEAN_FILE"
+        fi
+    fi
     info "${EMPLOYEES_FILENAME}: $(wc -l < "$EMPLOYEES_FILE" | tr -d ' ') documents"
 fi
 

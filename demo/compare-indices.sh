@@ -2,12 +2,23 @@
 # compare-indices.sh — Find documents present in index-a but missing from index-b.
 #
 # Strategies:
-#   querydsl (default)
+#   querydsl
 #     1. Run _count on both indices to detect a mismatch early.
 #     2. Open a Point-in-Time (PIT) on index-a for a consistent snapshot.
 #     3. Paginate through all document IDs using search_after (_source: false).
 #     4. For each page, batch-check existence in index-b via _mget.
 #     5. Collect missing IDs, write them to a file, and print a summary.
+#
+#   business-key
+#     Compares by (first_name, last_name, birth_date) instead of _id.
+#     Useful when documents were ingested via different pipelines and _id values
+#     do not correspond between indices.
+#     1. Open a PIT on index-a for a consistent snapshot.
+#     2. Paginate with search_after, fetching only the three business-key fields.
+#     3. For each page, build one msearch request with one sub-query per source
+#        doc (size:0, bool/must on the three fields). Each sub-response is
+#        independent: total.value == 0 means no match in target → missing.
+#     4. Zip source docs with msearch responses by index to collect missing _ids.
 #
 #   esql
 #     Not yet implemented.
@@ -15,12 +26,12 @@
 # Requirements: escli (./escli wrapper), jq
 #
 # Usage: ./compare-indices.sh [options]
-#   --source <name>        Source index                   (default: index-a)
-#   --target <name>        Target index                   (default: index-b)
-#   --batch-size <n>       IDs per search page / _mget call (default: 10000 - can't be more than ES's max_result_window)
-#   --pit-keep-alive <dur> PIT keep-alive duration        (default: 5m)
-#   --output <file>        Output file for missing IDs    (default: missing-ids.txt)
-#   --strategy <name>      Comparison strategy            (default: querydsl)
+#   --source <name>        Source index                      (default: index-a)
+#   --target <name>        Target index                      (default: index-b)
+#   --batch-size <n>       Docs per search page              (default: 10000)
+#   --pit-keep-alive <dur> PIT keep-alive duration           (default: 5m)
+#   --output <file>        Output file for missing IDs       (default: missing-ids.txt)
+#   --strategy <name>      Comparison strategy               (default: business-key)
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -55,7 +66,7 @@ set -a && set +u && source "${SCRIPT_DIR}/.env.sh" && set -u && set +a
 : "${BATCH_SIZE:=10000}"
 : "${PIT_KEEP_ALIVE:=5m}"
 : "${OUTPUT_FILE:=missing-ids.txt}"
-: "${STRATEGY:=querydsl}"
+: "${STRATEGY:=business-key}"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -66,7 +77,7 @@ while [[ $# -gt 0 ]]; do
         --output)          OUTPUT_FILE="$2";      shift 2 ;;
         --strategy)        STRATEGY="$2";         shift 2 ;;
         -h|--help)
-            grep '^# ' "$0" | head -25 | sed 's/^# \?//'
+            grep '^# ' "$0" | head -35 | sed 's/^# \?//'
             exit 0 ;;
         *) die "Unknown option: $1" ;;
     esac
@@ -74,8 +85,9 @@ done
 
 case "$STRATEGY" in
     querydsl) ;;
+    business-key) ;;
     esql) die "Strategy 'esql' is not yet implemented." ;;
-    *) die "Unknown strategy: ${STRATEGY}. Valid values: querydsl, esql" ;;
+    *) die "Unknown strategy: ${STRATEGY}. Valid values: querydsl, business-key, esql" ;;
 esac
 
 command -v jq >/dev/null || die "jq is required (brew install jq / apt install jq)"
@@ -96,11 +108,159 @@ info "${INDEX_B}: ${COUNT_B} documents"
 if (( COUNT_A == COUNT_B )); then
     log "Both indices have the same document count (${COUNT_A}). Indices appear to be in sync."
     exit 0
+else
+    DIFF=$(( COUNT_A - COUNT_B ))
+    warn "${INDEX_B} has ${DIFF} fewer document(s) than ${INDEX_A}."
 fi
-
-DIFF=$(( COUNT_A - COUNT_B ))
-warn "${INDEX_B} has ${DIFF} fewer document(s) than ${INDEX_A}. Starting full ID comparison..."
 echo ""
+
+# ── strategy: business-key ────────────────────────────────────────────────────
+# Compares by (first_name, last_name, birth_date) — no _id matching.
+# Each source page is used to build a bool/should query against the target.
+# Source docs whose tuple has no counterpart in the target response are missing.
+if [[ "$STRATEGY" == "business-key" ]]; then
+    log "Opening Point-in-Time on ${INDEX_A} (keep-alive: ${PIT_KEEP_ALIVE})..."
+    BK_PIT_ID=$("$ESCLI" open_point_in_time "$INDEX_A" "$PIT_KEEP_ALIVE" | jq -r '.id // empty')
+    [ -z "$BK_PIT_ID" ] && die "Failed to open PIT."
+
+    close_pit() {
+        local exit_code=$?
+        log "Closing Point-in-Time..."
+        "$ESCLI" close_point_in_time <<< "{\"id\":\"${BK_PIT_ID}\"}" > /dev/null 2>&1 || true
+        exit $exit_code
+    }
+    trap close_pit EXIT
+
+    log "Scanning ${INDEX_A} by business key in batches of ${BATCH_SIZE}..."
+    (( IS_TTY )) || echo ""
+
+    OUTPUT_PATH="${SCRIPT_DIR}/${OUTPUT_FILE}"
+    > "$OUTPUT_PATH"
+
+    SEARCH_AFTER="null"
+    TOTAL_CHECKED=0
+    MISSING_COUNT=0
+    PAGE=0
+    TOTAL_SEARCH_MS=0
+    TOTAL_MSEARCH_MS=0
+
+    while true; do
+        PAGE=$(( PAGE + 1 ))
+
+        # Fetch source docs with only the three business-key fields
+        SEARCH_BODY=$(jq -n \
+            --arg    pit_id        "$BK_PIT_ID"      \
+            --argjson search_after "$SEARCH_AFTER"   \
+            --argjson size         "$BATCH_SIZE"     \
+            --arg    keep_alive    "$PIT_KEEP_ALIVE" \
+            '{
+                "size": $size,
+                "_source": ["first_name", "last_name", "birth_date"],
+                "pit": {"id": $pit_id, "keep_alive": $keep_alive},
+                "sort": [{"_shard_doc": "asc"}]
+            } + (if $search_after != null then {"search_after": $search_after} else {} end)')
+
+        SEARCH_START=$(now_ms)
+        SEARCH_RESPONSE=$("$ESCLI" search <<< "$SEARCH_BODY")
+        SEARCH_MS=$(( $(now_ms) - SEARCH_START ))
+        TOTAL_SEARCH_MS=$(( TOTAL_SEARCH_MS + SEARCH_MS ))
+
+        NEW_PIT_ID=$(echo "$SEARCH_RESPONSE" | jq -r '.pit_id // empty')
+        [ -n "$NEW_PIT_ID" ] && BK_PIT_ID="$NEW_PIT_ID"
+
+        HITS=$(echo "$SEARCH_RESPONSE" | jq -c '.hits.hits')
+        HIT_COUNT=$(echo "$HITS" | jq 'length')
+        (( HIT_COUNT == 0 )) && break
+
+        TOTAL_CHECKED=$(( TOTAL_CHECKED + HIT_COUNT ))
+        SEARCH_AFTER=$(echo "$HITS" | jq -c '.[-1].sort')
+
+        # Filter out docs with any null business-key field — term queries reject nulls.
+        # FILTERED is a JSON array aligned 1-to-1 with the msearch responses.
+        FILTERED=$(echo "$HITS" | jq -c '[.[] | select(
+            ._source.first_name != null and
+            ._source.last_name  != null and
+            ._source.birth_date != null
+        )]')
+
+        FILTERED_COUNT=$(echo "$FILTERED" | jq 'length')
+        MSEARCH_MS=0
+
+        if (( FILTERED_COUNT > 0 )); then
+            # Extract source _ids in the same order as the msearch sub-queries.
+            IDS=$(echo "$FILTERED" | jq -c '[.[]._id]')
+
+            # Build msearch NDJSON: one (header + body) pair per source doc.
+            # size:0 — we only need hits.total.value, not the actual documents.
+            # tojson safely escapes special characters in field values.
+            MSEARCH_BODY=$(echo "$FILTERED" | jq -r \
+                --arg idx "$INDEX_B" \
+                '.[] | (
+                    ({"index": $idx} | tojson),
+                    ({
+                        "size": 0,
+                        "query": {"bool": {"must": [
+                            {"term": {"first_name.keyword": ._source.first_name}},
+                            {"term": {"last_name.keyword":  ._source.last_name}},
+                            {"term": {"birth_date":         ._source.birth_date}}
+                        ]}}
+                    } | tojson)
+                )')
+
+            MSEARCH_START=$(now_ms)
+            MSEARCH_RESPONSE=$("$ESCLI" msearch <<< "$MSEARCH_BODY")
+            MSEARCH_MS=$(( $(now_ms) - MSEARCH_START ))
+            TOTAL_MSEARCH_MS=$(( TOTAL_MSEARCH_MS + MSEARCH_MS ))
+
+            # to_entries gives [{key:0, value:response0}, ...].
+            # .key is the index into $ids — no transpose needed.
+            # MSEARCH_RESPONSE is piped via stdin to avoid ARG_MAX limits.
+            MISSING_IDS=$(echo "$MSEARCH_RESPONSE" | jq -r \
+                --argjson ids "$IDS" \
+                '.responses | to_entries[] |
+                 select(.value.hits.total.value == 0) |
+                 $ids[.key]')
+
+            if [ -n "$MISSING_IDS" ]; then
+                echo "$MISSING_IDS" >> "$OUTPUT_PATH"
+                MISSING_COUNT=$(( MISSING_COUNT + $(echo "$MISSING_IDS" | wc -l | tr -d ' ') ))
+            fi
+        fi
+
+        _progress "Page ${PAGE} $(progress_bar $TOTAL_CHECKED $COUNT_A) - ⏳ search: $(format_ms $SEARCH_MS), msearch: $(format_ms $MSEARCH_MS)"
+    done
+
+    (( IS_TTY && _PROG_INIT )) && printf "\r\033[K" || echo ""
+    log "Comparison complete."
+    printf "  %-38s %d\n" "Total documents in ${INDEX_A}:"       "$COUNT_A"
+    printf "  %-38s %d\n" "Total documents in ${INDEX_B}:"       "$COUNT_B"
+    printf "  %-38s %d\n" "Documents checked:"                    "$TOTAL_CHECKED"
+    printf "  %-38s %d\n" "Documents missing from ${INDEX_B}:"   "$MISSING_COUNT"
+    if (( MISSING_COUNT > 0 && TOTAL_CHECKED > 0 )); then
+        PCT=$(( MISSING_COUNT * 100 / TOTAL_CHECKED ))
+        printf "  %-38s ~%d%%\n" "Missing rate:" "$PCT"
+    fi
+    if (( PAGE > 0 )); then
+        printf "  %-38s search:  total %s, avg %s/page\n" \
+            "Scan stats (${PAGE} pages):" \
+            "$(format_ms $TOTAL_SEARCH_MS)" \
+            "$(format_ms $(( TOTAL_SEARCH_MS / PAGE )))"
+        printf "  %-38s msearch: total %s, avg %s/page\n" \
+            "" \
+            "$(format_ms $TOTAL_MSEARCH_MS)" \
+            "$(format_ms $(( TOTAL_MSEARCH_MS / PAGE )))"
+    fi
+    printf "  %-38s %s\n" "Duration:" "$(format_duration $SECONDS)"
+    if (( MISSING_COUNT > 0 )); then
+        echo ""
+        info "Missing IDs written to: ${OUTPUT_PATH}"
+        warn "Run ./reindex-missing.sh --strategy mgetbulk to reindex them."
+    else
+        echo ""
+        log "No missing documents found."
+    fi
+    exit 0
+fi
 
 # ── 2. Open a Point-in-Time on index-a ───────────────────────────────────────
 # A PIT freezes a consistent view of the index for the duration of the scan.
