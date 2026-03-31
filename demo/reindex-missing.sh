@@ -17,6 +17,7 @@
 #                         reindex     _reindex API with ids query, batched from input file (default)
 #                         reindex-all _reindex API with no filter (full copy)
 #                         esclidump   escli utils dump (ids query) piped into escli utils load
+#                         op_type     _reindex with op_type=create — conflicts on existing docs, creates missing ones
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -58,15 +59,15 @@ while [[ $# -gt 0 ]]; do
         --batch-size) BATCH_SIZE="$2";  shift 2 ;;
         --strategy)   STRATEGY="$2";    shift 2 ;;
         -h|--help)
-            grep '^# ' "$0" | head -21 | sed 's/^# \?//'
+            grep '^# ' "$0" | head -22 | sed 's/^# \?//'
             exit 0 ;;
         *) die "Unknown option: $1" ;;
     esac
 done
 
 case "$STRATEGY" in
-    mgetbulk|reindex|reindex-all|esclidump) ;;
-    *) die "Unknown strategy: ${STRATEGY}. Valid values: mgetbulk, reindex, reindex-all, esclidump" ;;
+    mgetbulk|reindex|reindex-all|esclidump|op_type) ;;
+    *) die "Unknown strategy: ${STRATEGY}. Valid values: mgetbulk, reindex, reindex-all, esclidump, op_type" ;;
 esac
 
 command -v jq >/dev/null || die "jq is required (brew install jq / apt install jq)"
@@ -95,6 +96,44 @@ if [[ "$STRATEGY" == "reindex-all" ]]; then
     printf "  %-38s %d\n" "Documents processed:"                "$TOTAL"
     printf "  %-38s %d\n" "Created in ${INDEX_B}:"             "$CREATED"
     printf "  %-38s %d\n" "Updated in ${INDEX_B}:"             "$UPDATED"
+    if (( FAILURES > 0 )); then
+        printf "  %-38s %d\n" "Failures:" "$FAILURES"
+        warn "Some documents failed to reindex."
+    fi
+    printf "  %-38s %s\n" "Duration:" "$(format_duration $SECONDS)"
+    exit 0
+fi
+
+# ── strategy: op_type ────────────────────────────────────────────────────────
+# Full reindex from index-a into index-b with op_type=create.
+# Documents already present in index-b produce version-conflict errors (counted
+# and ignored via conflicts=proceed). Only missing documents are created.
+# No input file needed.
+if [[ "$STRATEGY" == "op_type" ]]; then
+    log "Strategy: op_type — reindexing all documents from ${INDEX_A} into ${INDEX_B} (op_type=create)..."
+    echo ""
+
+    REINDEX_BODY=$(jq -n \
+        --arg src "$INDEX_A" \
+        --arg dst "$INDEX_B" \
+        '{"conflicts":"proceed","source":{"index":$src},"dest":{"index":$dst,"op_type":"create"}}')
+
+    REINDEX_RESPONSE=$("$ESCLI" reindex <<< "$REINDEX_BODY")
+
+    TOTAL=$(echo "$REINDEX_RESPONSE"     | jq '.total')
+    CREATED=$(echo "$REINDEX_RESPONSE"   | jq '.created')
+    UPDATED=$(echo "$REINDEX_RESPONSE"   | jq '.updated')
+    CONFLICTS=$(echo "$REINDEX_RESPONSE" | jq '.version_conflicts')
+    FAILURES=$(echo "$REINDEX_RESPONSE"  | jq '.failures | length')
+
+    echo ""
+    log "Re-indexing complete."
+    printf "  %-38s %d\n" "Documents processed:"                "$TOTAL"
+    printf "  %-38s %d\n" "Created in ${INDEX_B}:"             "$CREATED"
+    printf "  %-38s %d\n" "Skipped (already existed):"         "$CONFLICTS"
+    if (( UPDATED > 0 )); then
+        printf "  %-38s %d\n" "Updated in ${INDEX_B}:"         "$UPDATED"
+    fi
     if (( FAILURES > 0 )); then
         printf "  %-38s %d\n" "Failures:" "$FAILURES"
         warn "Some documents failed to reindex."

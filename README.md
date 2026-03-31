@@ -165,16 +165,17 @@ via `_mget` and write them via `_bulk` instead.
 | `--target`     | `index-b`         | Target index to reindex into                                     |
 | `--input`      | `missing-ids.txt` | File of IDs produced by `compare-indices.sh`                     |
 | `--batch-size` | `10000`           | IDs per request                                                  |
-| `--strategy`   | `reindex`         | `mgetbulk`, `reindex`, `reindex-all`, or `esclidump`             |
+| `--strategy`   | `reindex`         | `mgetbulk`, `reindex`, `reindex-all`, `esclidump`, or `op_type`  |
 
 Strategy details:
 
-| Strategy      | Description                                                                       |
-|---------------|-----------------------------------------------------------------------------------|
-| `mgetbulk`    | `_mget` from source + `_bulk` into target (client-side transport)                 |
-| `reindex`     | `_reindex` with `ids` query per batch (server-side, no document data on the wire) |
-| `reindex-all` | `_reindex` with no filter — full copy, ignores the input file                     |
-| `esclidump`   | `escli utils dump` (ids query) piped into `escli utils load` (binary-to-binary)   |
+| Strategy      | Description                                                                                        |
+|---------------|----------------------------------------------------------------------------------------------------|
+| `mgetbulk`    | `_mget` from source + `_bulk` into target (client-side transport)                                  |
+| `reindex`     | `_reindex` with `ids` query per batch (server-side, no document data on the wire)                  |
+| `reindex-all` | `_reindex` with no filter — full copy, ignores the input file                                      |
+| `esclidump`   | `escli utils dump` (ids query) piped into `escli utils load` (binary-to-binary)                    |
+| `op_type`     | `_reindex` with `op_type=create` — conflicts on existing docs, only missing ones are created       |
 
 ### 6. Restore the snapshot and re-test
 
