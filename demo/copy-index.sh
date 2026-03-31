@@ -8,8 +8,9 @@
 #   ./copy-index.sh
 #
 # Usage: ./copy-index.sh [options]
-#   --source <name>   Source index  (default: index-target)
-#   --target <name>   Target index  (default: index-b)
+#   --source <name>    Source index    (default: index-target)
+#   --target <name>    Target index    (default: index-b)
+#   --mapping <file>   Mapping JSON    (default: mapping.json in script dir, if present)
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -25,13 +26,15 @@ set -a && set +u && source "${SCRIPT_DIR}/.env.sh" && set -u && set +a
 
 : "${COPY_SOURCE:=index-target}"
 : "${COPY_TARGET:=index-b}"
+: "${MAPPING_FILE:=${SCRIPT_DIR}/mapping.json}"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --source) COPY_SOURCE="$2"; shift 2 ;;
-        --target) COPY_TARGET="$2"; shift 2 ;;
+        --source)  COPY_SOURCE="$2";  shift 2 ;;
+        --target)  COPY_TARGET="$2";  shift 2 ;;
+        --mapping) MAPPING_FILE="$2"; shift 2 ;;
         -h|--help)
-            grep '^# ' "$0" | head -12 | sed 's/^# \?//'
+            grep '^# ' "$0" | head -13 | sed 's/^# \?//'
             exit 0 ;;
         *) die "Unknown option: $1" ;;
     esac
@@ -52,7 +55,17 @@ else
     info "Index ${COPY_TARGET} did not exist — nothing to delete"
 fi
 
-# ── 3. Reindex source → target ─────────────────────────────────────────────────
+# ── 3. Recreate target with mapping (if available) ────────────────────────────
+# Creating the target explicitly before reindexing ensures the correct mapping
+# and field types (e.g. .keyword sub-fields) are in place.
+if [[ -f "$MAPPING_FILE" ]]; then
+    log "Creating ${COPY_TARGET} with mapping from $(basename "$MAPPING_FILE")..."
+    "$ESCLI" indices create "$COPY_TARGET" --input "$MAPPING_FILE" &>/dev/null
+else
+    info "No mapping file found at ${MAPPING_FILE} — target will be auto-created by _reindex"
+fi
+
+# ── 4. Reindex source → target ─────────────────────────────────────────────────
 log "Copying ${COPY_SOURCE} → ${COPY_TARGET}..."
 
 REINDEX_BODY=$(jq -n \
