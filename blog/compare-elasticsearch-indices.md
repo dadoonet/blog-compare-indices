@@ -54,7 +54,7 @@ The `_count` API returns:
 
 If the counts differ, proceed to the full comparison.
 
-## Step 2 — When IDs Are Stable: Use `op_type=create`
+## Step 2 — When IDs Mean Something: Use `op_type=create`
 
 If both indices use the same `_id` for the same document — for example, because you indexed documents using a functional business key like `emp_no` rather than a generated UUID — you can find and fix missing documents in a single `_reindex` call.
 
@@ -63,7 +63,8 @@ If both indices use the same `_id` for the same document — for example, becaus
 Using a meaningful field as `_id` (instead of a random UUID) is a best practice when the data has a natural key. It means:
 
 - The same document always gets the same `_id`, regardless of which pipeline ingested it.
-- You can use `op_type=create` to skip documents that already exist in the target.
+- You can easily update or delete documents by ID.
+- You can use [`op_type=create`](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-index#operation-index-op_type) to skip documents that already exist in the target.
 - No client-side scanning or comparison is needed.
 
 ### The `op_type=create` trick
@@ -152,16 +153,15 @@ The response contains one entry per sub-query, in the same order:
 
 `total.value == 0` means no document in `index-b` matches that business key — the document is missing. Collect the corresponding `_id` from the source page.
 
-> **Why `_msearch` instead of a single `bool/should`?**
-> A `bool/should` query combining all source documents into one request would return at most `size` results, silently truncating matches when there are more documents than the page size. `_msearch` sends one independent sub-query per document — each gets its own `total.value` — so there is no truncation.
-
 > **Note on `.keyword` sub-fields**: `term` queries require exact (keyword) matching. The `first_name` and `last_name` fields must have a `.keyword` sub-field in the index mapping. The demo's `mapping.json` includes this.
 
 ### 3c — Speed it up with `split-by-date`
 
 If the business key includes a date field, you can partition the source into date slices and run each slice as an independent job. Each slice opens its own PIT with a `range` filter on `birth_date`, runs its own msearch loop, and writes its results to a separate file. The parent script launches all slices in parallel and aggregates the results when they are all done.
 
-```
+But depending on your use case, you might want to partition by a different field — for example, if you have a `team` field, you could run one slice per team. The key is to find a field that allows you to split the data into reasonably even chunks that can be processed in parallel.
+
+```txt
 [compare] Launching 5 slices in parallel...
 
   → Slice 1: 1960-01-01 → 1969-12-31 ✅ — 244408 checked, 12207 missing
@@ -177,43 +177,24 @@ To validate the approaches, the demo generates 1,000,000 documents in `index-a` 
 
 Results on a MacBook M3 Pro:
 
-**Dataset generation** (`init-dataset.sh`):
-
-```txt
-Documents generated:                 1000000
-Indexed into index-a:                1000000
-Indexed into index-b:                950406
-Effective miss rate:                 ~5%
-Duration:                            2m 30s
-```
-
 **Comparison** (`compare-indices.sh`):
 
-| Strategy           | Duration | How it works                               |
-|--------------------|----------|--------------------------------------------|
-| `op_type=create`   | **6s**   | Full `_reindex` server-side, skips existing|
-| `querydsl`         | 37s      | PIT scan + `_mget` existence check by ID   |
-| `business-key`     | 1m 38s   | PIT scan + `_msearch` by business key      |
-| `split-by-date`    | **32s**  | Same as `business-key`, 5 slices in parallel|
+| Strategy        | Compare | Reindex | Total  | How it works                                      |
+|-----------------|---------|---------|--------|---------------------------------------------------|
+| `op_type`       |         | **6s**  | **6s** | Full `_reindex` server-side, skips existing       |
+| `business-key`  | 1m 38s  | 4s.     | 1m 42s | PIT scan + `_msearch` by business key             |
+| `split-by-date` | **32s** | **4s**  | **36s**| Same as `business-key`, 5 slices in parallel      |
 
-**Reindex of missing documents** (`reindex-missing.sh`):
-
-```txt
-IDs read from input file:            49594
-Documents re-indexed into index-b:   49594
-Duration:                            4s
-```
-
-The `op_type=create` approach is fastest because everything is server-side and requires no client-side scanning. The `split-by-date` strategy brings the business-key approach within range of the `querydsl` strategy through parallelism.
+The `op_type=create` approach is fastest because everything is server-side and requires no client-side scanning. The `split-by-date` strategy cuts the `business-key` duration from 1m 38s down to 36s through parallelism — not bad for a comparison across two 1-million-document indices.
 
 ## Decision Tree
 
-```
+```txt
 Are _id values stable between both indices?
 ├── Yes → _reindex with op_type=create          (6s, server-side)
 └── No  → Do you have a reliable business key?
-          ├── Yes, simple scan is fast enough → business-key   (1m 38s)
-          └── Yes, and you need more speed    → split-by-date  (32s, parallel)
+          ├── Yes, simple scan is fast enough → business-key   (1m 42s)
+          └── Yes, and you need more speed    → split-by-date  (36s, parallel)
 ```
 
 ## Conclusion
@@ -221,6 +202,6 @@ Are _id values stable between both indices?
 Elasticsearch doesn't offer a native index diff command, but the right strategy depends on your data model:
 
 - **Use functional `_id`s** (a natural business key like `emp_no`) whenever possible. It unlocks the simplest and fastest approach: `_reindex` with `op_type=create` finds and fills gaps in one server-side call.
-- **When IDs are unstable**, match by business key using PIT + `_msearch`. Partition by a date field and run slices in parallel to recover most of the performance.
+- **When IDs are unstable**, match by business key using PIT + `_msearch`. Partition by a field and run slices in parallel to recover most of the performance. If you find yourself doing this regularly, consider computing a hash of your business key fields and using it as `_id` at ingestion time — you get the best of both worlds: stable IDs and efficient lookups.
 
-The complete demo — dataset generation, comparison scripts, and reindex scripts — is available at [[URL_PLACE_HOLDER](https://github.com/dadoonet/blog-compare-indices/)].
+The complete demo — dataset generation, comparison scripts, and reindex scripts — is available at [https://github.com/dadoonet/blog-compare-indices/](https://github.com/dadoonet/blog-compare-indices/).
