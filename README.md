@@ -34,9 +34,10 @@ Blog post and demo showing how to compare two Elasticsearch indices and find mis
 The article explains how to efficiently detect documents present in one index but missing in another, using:
 
 - **`_count`** for a fast pre-check
-- **PIT + `search_after`** to paginate through the source index (IDs only, no `_source`)
-- **`_mget`** to batch-check document existence in the target index
-- **`_reindex`** with an `ids` query to copy only the missing documents, entirely server-side
+- **PIT + `search_after`** to paginate through the source index
+- **`_mget`** to batch-check document existence by `_id` (when IDs are stable)
+- **`_msearch`** to match documents by business key (`first_name`, `last_name`, `birth_date`) when IDs differ
+- **`_reindex`** with `op_type=create` to copy only missing documents, entirely server-side
 
 ## Demo
 
@@ -123,28 +124,37 @@ Find all documents present in `index-a` but missing from `index-b`:
 ./compare-indices.sh
 ```
 
-The script will:
-
-1. Run `_count` on both indices — exits early if counts are equal
-2. Open a Point-in-Time on `index-a` for a consistent snapshot
-3. Paginate through all IDs using `search_after`
-4. Batch-check existence in `index-b` via `_mget`
-5. Write missing IDs to `missing-ids.txt` and print a summary
+The script runs `_count` on both indices first and exits early if they are equal.
+It then scans the source with PIT + `search_after` and checks each page against the target,
+writing missing IDs to `missing-ids.txt`.
 
 Override defaults via CLI:
 
 ```bash
-./compare-indices.sh --batch-size 500 --output my-missing.txt
+./compare-indices.sh --strategy querydsl --batch-size 500 --output my-missing.txt
 ```
 
-| Parameter          | Default           | Description                                            |
-|--------------------|-------------------|--------------------------------------------------------|
-| `--source`         | `index-a`         | Source index to scan                                   |
-| `--target`         | `index-b`         | Target index to check against                          |
-| `--batch-size`     | `10000`           | IDs per search page / `_mget` call                     |
-| `--pit-keep-alive` | `5m`              | PIT keep-alive duration                                |
-| `--output`         | `missing-ids.txt` | Output file for missing IDs                            |
-| `--strategy`       | `querydsl`        | Comparison strategy (`querydsl`, `esql` — coming soon) |
+| Parameter          | Default           | Description                                                             |
+|--------------------|-------------------|-------------------------------------------------------------------------|
+| `--source`         | `index-a`         | Source index to scan                                                    |
+| `--target`         | `index-b`         | Target index to check against                                           |
+| `--batch-size`     | `10000`           | Documents per search page                                               |
+| `--pit-keep-alive` | `5m`              | PIT keep-alive duration                                                 |
+| `--output`         | `missing-ids.txt` | Output file for missing IDs                                             |
+| `--strategy`       | `business-key`    | Comparison strategy: `querydsl`, `business-key`, `split-by-date`, `esql`|
+| `--slice-years`    | `10`              | Years per date slice (`split-by-date` only)                             |
+
+#### Strategies
+
+| Strategy        | How it works                                                                                  |
+|-----------------|-----------------------------------------------------------------------------------------------|
+| `querydsl`      | PIT scan fetching `_id` only, then `_mget` to check existence in target. Requires stable IDs. |
+| `business-key`  | PIT scan fetching `first_name`, `last_name`, `birth_date`, then one `_msearch` sub-query per doc. Works when `_id` values differ between indices. |
+| `split-by-date` | Same as `business-key` but partitions the source by `birth_date` year slices. Each slice runs in a **parallel background job**, making it ~3× faster on large indices. |
+| `esql`          | Not yet implemented.                                                                          |
+
+> **Note:** `business-key` and `split-by-date` require the index mapping to include
+> `.keyword` sub-fields on `first_name` and `last_name` (provided by `mapping.json`).
 
 ### 5. Re-index missing documents
 
