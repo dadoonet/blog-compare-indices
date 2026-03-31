@@ -20,6 +20,16 @@
 #        independent: total.value == 0 means no match in target → missing.
 #     4. Zip source docs with msearch responses by index to collect missing _ids.
 #
+#   split-by-date
+#     Same as business-key but partitions the source index by birth_date time
+#     slices before scanning. Each slice opens its own PIT, reducing per-pass
+#     volume and enabling future parallelism.
+#     1. Aggregate min/max birth_date on the source index.
+#     2. Divide the date range into slices of --slice-years years.
+#     3. For each slice: open a PIT, paginate with a birth_date range filter,
+#        run the same msearch sub-query logic as business-key.
+#     4. Append missing _ids from all slices into the output file.
+#
 #   esql
 #     Not yet implemented.
 #
@@ -32,6 +42,7 @@
 #   --pit-keep-alive <dur> PIT keep-alive duration           (default: 5m)
 #   --output <file>        Output file for missing IDs       (default: missing-ids.txt)
 #   --strategy <name>      Comparison strategy               (default: business-key)
+#   --slice-years <n>      Years per date slice (split-by-date only) (default: 10)
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -67,6 +78,7 @@ set -a && set +u && source "${SCRIPT_DIR}/.env.sh" && set -u && set +a
 : "${PIT_KEEP_ALIVE:=5m}"
 : "${OUTPUT_FILE:=missing-ids.txt}"
 : "${STRATEGY:=business-key}"
+: "${SLICE_YEARS:=10}"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -76,8 +88,9 @@ while [[ $# -gt 0 ]]; do
         --pit-keep-alive)  PIT_KEEP_ALIVE="$2";   shift 2 ;;
         --output)          OUTPUT_FILE="$2";      shift 2 ;;
         --strategy)        STRATEGY="$2";         shift 2 ;;
+        --slice-years)     SLICE_YEARS="$2";      shift 2 ;;
         -h|--help)
-            grep '^# ' "$0" | head -35 | sed 's/^# \?//'
+            grep '^# ' "$0" | head -44 | sed 's/^# \?//'
             exit 0 ;;
         *) die "Unknown option: $1" ;;
     esac
@@ -86,8 +99,9 @@ done
 case "$STRATEGY" in
     querydsl) ;;
     business-key) ;;
+    split-by-date) ;;
     esql) die "Strategy 'esql' is not yet implemented." ;;
-    *) die "Unknown strategy: ${STRATEGY}. Valid values: querydsl, business-key, esql" ;;
+    *) die "Unknown strategy: ${STRATEGY}. Valid values: querydsl, business-key, split-by-date, esql" ;;
 esac
 
 command -v jq >/dev/null || die "jq is required (brew install jq / apt install jq)"
@@ -249,6 +263,187 @@ if [[ "$STRATEGY" == "business-key" ]]; then
             "" \
             "$(format_ms $TOTAL_MSEARCH_MS)" \
             "$(format_ms $(( TOTAL_MSEARCH_MS / PAGE )))"
+    fi
+    printf "  %-38s %s\n" "Duration:" "$(format_duration $SECONDS)"
+    if (( MISSING_COUNT > 0 )); then
+        echo ""
+        info "Missing IDs written to: ${OUTPUT_PATH}"
+        warn "Run ./reindex-missing.sh --strategy mgetbulk to reindex them."
+    else
+        echo ""
+        log "No missing documents found."
+    fi
+    exit 0
+fi
+
+# ── strategy: split-by-date ──────────────────────────────────────────────────
+# Partitions the source index into birth_date slices of SLICE_YEARS years each.
+# Each slice runs the same msearch business-key logic with a range filter on
+# birth_date, reducing per-pass volume and making slices independently scannable.
+if [[ "$STRATEGY" == "split-by-date" ]]; then
+    # 1. Aggregate min/max birth_date to determine the slice boundaries
+    log "Aggregating birth_date range on ${INDEX_A}..."
+    DATE_AGG=$("$ESCLI" search --index "$INDEX_A" <<< \
+        '{"size":0,"aggs":{"min_d":{"min":{"field":"birth_date"}},"max_d":{"max":{"field":"birth_date"}}}}')
+    MIN_YEAR=$(echo "$DATE_AGG" | jq -r '.aggregations.min_d.value_as_string' | cut -c1-4)
+    MAX_YEAR=$(echo "$DATE_AGG" | jq -r '.aggregations.max_d.value_as_string' | cut -c1-4)
+    [ -z "$MIN_YEAR" ] || [ -z "$MAX_YEAR" ] && die "Could not determine birth_date range from ${INDEX_A}."
+    info "birth_date range: ${MIN_YEAR} → ${MAX_YEAR} (${SLICE_YEARS}-year slices)"
+    echo ""
+
+    OUTPUT_PATH="${SCRIPT_DIR}/${OUTPUT_FILE}"
+    > "$OUTPUT_PATH"
+
+    # Current PIT ID — updated before each slice so the EXIT trap can close it on error
+    SD_PIT_ID=""
+    close_pit() {
+        local exit_code=$?
+        [ -n "$SD_PIT_ID" ] && \
+            "$ESCLI" close_point_in_time <<< "{\"id\":\"${SD_PIT_ID}\"}" >/dev/null 2>&1 || true
+        exit $exit_code
+    }
+    trap close_pit EXIT
+
+    TOTAL_CHECKED=0
+    MISSING_COUNT=0
+    TOTAL_PAGES=0
+    TOTAL_SEARCH_MS=0
+    TOTAL_MSEARCH_MS=0
+    SLICE_NUM=0
+
+    # 2. Iterate over date slices
+    SLICE_START=$MIN_YEAR
+    while (( SLICE_START <= MAX_YEAR )); do
+        SLICE_END=$(( SLICE_START + SLICE_YEARS - 1 ))
+        SLICE_GTE="${SLICE_START}-01-01"
+        SLICE_LTE="${SLICE_END}-12-31"
+        SLICE_NUM=$(( SLICE_NUM + 1 ))
+
+        log "Slice ${SLICE_NUM}: ${SLICE_GTE} → ${SLICE_LTE}"
+        (( IS_TTY )) || echo ""
+
+        SD_PIT_ID=$("$ESCLI" open_point_in_time "$INDEX_A" "$PIT_KEEP_ALIVE" | jq -r '.id // empty')
+        [ -z "$SD_PIT_ID" ] && die "Failed to open PIT for slice ${SLICE_NUM}."
+
+        SEARCH_AFTER="null"
+        SLICE_CHECKED=0
+        SLICE_MISSING=0
+        PAGE=0
+        _PROG_INIT=0   # reset progress line for each slice
+
+        # 3. Paginate through this date slice
+        while true; do
+            PAGE=$(( PAGE + 1 ))
+
+            SEARCH_BODY=$(jq -n \
+                --arg    pit_id        "$SD_PIT_ID"      \
+                --argjson search_after "$SEARCH_AFTER"   \
+                --argjson size         "$BATCH_SIZE"     \
+                --arg    keep_alive    "$PIT_KEEP_ALIVE" \
+                --arg    gte           "$SLICE_GTE"      \
+                --arg    lte           "$SLICE_LTE"      \
+                '{
+                    "size": $size,
+                    "_source": ["first_name", "last_name", "birth_date"],
+                    "pit": {"id": $pit_id, "keep_alive": $keep_alive},
+                    "sort": [{"_shard_doc": "asc"}],
+                    "query": {"range": {"birth_date": {"gte": $gte, "lte": $lte}}}
+                } + (if $search_after != null then {"search_after": $search_after} else {} end)')
+
+            SEARCH_START=$(now_ms)
+            SEARCH_RESPONSE=$("$ESCLI" search <<< "$SEARCH_BODY")
+            SEARCH_MS=$(( $(now_ms) - SEARCH_START ))
+            TOTAL_SEARCH_MS=$(( TOTAL_SEARCH_MS + SEARCH_MS ))
+
+            NEW_PIT_ID=$(echo "$SEARCH_RESPONSE" | jq -r '.pit_id // empty')
+            [ -n "$NEW_PIT_ID" ] && SD_PIT_ID="$NEW_PIT_ID"
+
+            HITS=$(echo "$SEARCH_RESPONSE" | jq -c '.hits.hits')
+            HIT_COUNT=$(echo "$HITS" | jq 'length')
+            (( HIT_COUNT == 0 )) && break
+
+            SLICE_CHECKED=$(( SLICE_CHECKED + HIT_COUNT ))
+            SEARCH_AFTER=$(echo "$HITS" | jq -c '.[-1].sort')
+
+            FILTERED=$(echo "$HITS" | jq -c '[.[] | select(
+                ._source.first_name != null and
+                ._source.last_name  != null and
+                ._source.birth_date != null
+            )]')
+            FILTERED_COUNT=$(echo "$FILTERED" | jq 'length')
+            MSEARCH_MS=0
+
+            if (( FILTERED_COUNT > 0 )); then
+                IDS=$(echo "$FILTERED" | jq -c '[.[]._id]')
+
+                MSEARCH_BODY=$(echo "$FILTERED" | jq -r \
+                    --arg idx "$INDEX_B" \
+                    '.[] | (
+                        ({"index": $idx} | tojson),
+                        ({
+                            "size": 0,
+                            "query": {"bool": {"must": [
+                                {"term": {"first_name.keyword": ._source.first_name}},
+                                {"term": {"last_name.keyword":  ._source.last_name}},
+                                {"term": {"birth_date":         ._source.birth_date}}
+                            ]}}
+                        } | tojson)
+                    )')
+
+                MSEARCH_START=$(now_ms)
+                MSEARCH_RESPONSE=$("$ESCLI" msearch <<< "$MSEARCH_BODY")
+                MSEARCH_MS=$(( $(now_ms) - MSEARCH_START ))
+                TOTAL_MSEARCH_MS=$(( TOTAL_MSEARCH_MS + MSEARCH_MS ))
+
+                MISSING_IDS=$(echo "$MSEARCH_RESPONSE" | jq -r \
+                    --argjson ids "$IDS" \
+                    '.responses | to_entries[] |
+                     select(.value.hits.total.value == 0) |
+                     $ids[.key]')
+
+                if [ -n "$MISSING_IDS" ]; then
+                    echo "$MISSING_IDS" >> "$OUTPUT_PATH"
+                    PAGE_MISSING=$(echo "$MISSING_IDS" | wc -l | tr -d ' ')
+                    SLICE_MISSING=$(( SLICE_MISSING + PAGE_MISSING ))
+                fi
+            fi
+
+            _progress "Page ${PAGE} $(progress_bar $SLICE_CHECKED $COUNT_A) - ⏳ search: $(format_ms $SEARCH_MS), msearch: $(format_ms $MSEARCH_MS)"
+        done
+
+        "$ESCLI" close_point_in_time <<< "{\"id\":\"${SD_PIT_ID}\"}" >/dev/null 2>&1 || true
+        SD_PIT_ID=""
+
+        TOTAL_CHECKED=$(( TOTAL_CHECKED + SLICE_CHECKED ))
+        MISSING_COUNT=$(( MISSING_COUNT + SLICE_MISSING ))
+        TOTAL_PAGES=$(( TOTAL_PAGES + PAGE ))
+
+        (( IS_TTY && _PROG_INIT )) && printf "\r\033[K" || echo ""
+        info "Slice ${SLICE_NUM} done: ${SLICE_CHECKED} checked, ${SLICE_MISSING} missing"
+
+        SLICE_START=$(( SLICE_START + SLICE_YEARS ))
+    done
+
+    echo ""
+    log "Comparison complete."
+    printf "  %-38s %d\n" "Total documents in ${INDEX_A}:"      "$COUNT_A"
+    printf "  %-38s %d\n" "Total documents in ${INDEX_B}:"      "$COUNT_B"
+    printf "  %-38s %d\n" "Documents checked:"                   "$TOTAL_CHECKED"
+    printf "  %-38s %d\n" "Documents missing from ${INDEX_B}:"  "$MISSING_COUNT"
+    if (( MISSING_COUNT > 0 && TOTAL_CHECKED > 0 )); then
+        PCT=$(( MISSING_COUNT * 100 / TOTAL_CHECKED ))
+        printf "  %-38s ~%d%%\n" "Missing rate:" "$PCT"
+    fi
+    printf "  %-38s %d (${SLICE_YEARS}-year slices)\n" "Date slices:" "$SLICE_NUM"
+    if (( TOTAL_PAGES > 0 )); then
+        printf "  %-38s search:  total %s, avg %s/page\n" \
+            "Scan stats (${TOTAL_PAGES} pages):" \
+            "$(format_ms $TOTAL_SEARCH_MS)" \
+            "$(format_ms $(( TOTAL_SEARCH_MS / TOTAL_PAGES )))"
+        printf "  %-38s msearch: total %s, avg %s/page\n" \
+            "" \
+            "$(format_ms $TOTAL_MSEARCH_MS)" \
+            "$(format_ms $(( TOTAL_MSEARCH_MS / TOTAL_PAGES )))"
     fi
     printf "  %-38s %s\n" "Duration:" "$(format_duration $SECONDS)"
     if (( MISSING_COUNT > 0 )); then
